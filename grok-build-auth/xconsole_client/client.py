@@ -840,6 +840,17 @@ class XConsoleAuthClient:
                     save=False,
                 )
             if not token:
+                # Extra fixed hops seen in current xAI deployments
+                for url, label in (
+                    ("https://auth.x.ai/set-cookie", "auth.x.ai/set-cookie"),
+                    ("https://auth.grokusercontent.com/set-cookie", "grokusercontent/set-cookie"),
+                    ("https://grok.com/", "grok.com.home"),
+                    ("https://accounts.x.ai/", "accounts.home"),
+                ):
+                    token = self._fetch_sso_via_url(url, label=label)
+                    if token:
+                        break
+            if not token:
                 token = self._fetch_sso_via_accounts_home()
             if not token:
                 token = self._fetch_sso_via_grok_home()

@@ -44,6 +44,30 @@ from . import config as C
 # public helpers
 # --------------------------------------------------------------------------- #
 
+def _normalize_rsc_text(rsc_body: str) -> str:
+    """Unescape common RSC/JSON encodings that hide set-cookie URLs."""
+    if not rsc_body:
+        return ""
+    text = rsc_body
+    # Multiple unescape passes for nested RSC string encoding.
+    for _ in range(3):
+        nxt = (
+            text.replace("\\u0026", "&")
+            .replace("\\u003d", "=")
+            .replace("\\u003f", "?")
+            .replace("\\u002F", "/")
+            .replace("\\u002f", "/")
+            .replace("\\/", "/")
+            .replace("\\\\/", "/")
+            .replace("&amp;", "&")
+            .replace("\\u0026amp;", "&")
+        )
+        if nxt == text:
+            break
+        text = nxt
+    return text
+
+
 def parse_sso_jwt_url(rsc_body: str) -> Optional[str]:
     """Return the first SSO ``set-cookie?q=<JWT>`` URL found in *rsc_body*.
 
@@ -51,16 +75,11 @@ def parse_sso_jwt_url(rsc_body: str) -> Optional[str]:
       - https://.../set-cookie?q=eyJ...
       - https://.../set-cookie/?q=eyJ...
       - escaped JSON/RSC forms with \\u0026 / \\u003d / &amp;
+      - bare JWT then reconstructed set-cookie URL
     """
     if not rsc_body:
         return None
-    text = (
-        rsc_body.replace("\\u0026", "&")
-        .replace("\\u003d", "=")
-        .replace("\\u002F", "/")
-        .replace("\\/", "/")
-        .replace("&amp;", "&")
-    )
+    text = _normalize_rsc_text(rsc_body)
     patterns = (
         # canonical
         r'https?://[^\s"\'<>\\]+set-cookie/?\?q='
@@ -70,6 +89,9 @@ def parse_sso_jwt_url(rsc_body: str) -> Optional[str]:
         r'(eyJ[a-zA-Z0-9_-]+\.[a-zA-Z0-9_-]+\.[a-zA-Z0-9_-]+)',
         # bare path
         r'/[^\s"\'<>\\]*set-cookie/?\?q='
+        r'(eyJ[a-zA-Z0-9_-]+\.[a-zA-Z0-9_-]+\.[a-zA-Z0-9_-]+)',
+        # set-cookie host with encoded separators
+        r'https?://auth\.(?:x\.ai|grokusercontent\.com)/set-cookie\?q='
         r'(eyJ[a-zA-Z0-9_-]+\.[a-zA-Z0-9_-]+\.[a-zA-Z0-9_-]+)',
     )
     for pat in patterns:
@@ -83,6 +105,16 @@ def parse_sso_jwt_url(rsc_body: str) -> Optional[str]:
             # prefer accounts host for relative paths
             url = "https://accounts.x.ai" + url
         return url
+
+    # Last resort: find a JWT near "set-cookie" and reconstruct a hop URL.
+    m = re.search(
+        r'set-cookie[^e]{0,80}(eyJ[a-zA-Z0-9_-]+\.[a-zA-Z0-9_-]+\.[a-zA-Z0-9_-]+)',
+        text,
+        flags=re.IGNORECASE,
+    )
+    if m:
+        jwt = m.group(1)
+        return f"https://auth.grokusercontent.com/set-cookie?q={jwt}"
     return None
 
 
@@ -90,12 +122,41 @@ def parse_sso_token_from_text(text: str) -> Optional[str]:
     """Extract a raw ``sso=<JWT>`` value embedded in HTML/RSC/body text."""
     if not text:
         return None
+    text = _normalize_rsc_text(text)
     m = re.search(
-        r'(?:^|[;,\s\'"])sso=(eyJ[a-zA-Z0-9_-]+\.[a-zA-Z0-9_-]+\.[a-zA-Z0-9_-]+)',
+        r'(?:^|[;,\s\'"\\])sso=(eyJ[a-zA-Z0-9_-]+\.[a-zA-Z0-9_-]+\.[a-zA-Z0-9_-]+)',
         text,
         flags=re.IGNORECASE | re.MULTILINE,
     )
     return m.group(1) if m else None
+
+
+def parse_all_set_cookie_urls(rsc_body: str) -> List[str]:
+    """Return all candidate set-cookie hop URLs from an RSC body."""
+    if not rsc_body:
+        return []
+    text = _normalize_rsc_text(rsc_body)
+    found: List[str] = []
+    for m in re.finditer(
+        r'https?://[^\s"\'<>\\]+set-cookie/?\?q='
+        r'eyJ[a-zA-Z0-9_-]+\.[a-zA-Z0-9_-]+\.[a-zA-Z0-9_-]+',
+        text,
+        flags=re.IGNORECASE,
+    ):
+        url = m.group(0)
+        if url not in found:
+            found.append(url)
+    # relative
+    for m in re.finditer(
+        r'/[^\s"\'<>\\]*set-cookie/?\?q='
+        r'eyJ[a-zA-Z0-9_-]+\.[a-zA-Z0-9_-]+\.[a-zA-Z0-9_-]+',
+        text,
+        flags=re.IGNORECASE,
+    ):
+        url = "https://accounts.x.ai" + m.group(0)
+        if url not in found:
+            found.append(url)
+    return found
 
 
 def parse_jwt_payload(jwt: str) -> Optional[Dict[str, Any]]:
@@ -230,29 +291,46 @@ class SSOExtractor:
                     print(f"  [sso] saved to: {path}")
             return token
 
-        # 1. find the JWT chain URL in the RSC body
-        sso_url = parse_sso_jwt_url(rsc_body)
-        if not sso_url:
+        # 1. collect all candidate hop URLs from RSC body
+        hop_urls = parse_all_set_cookie_urls(rsc_body)
+        primary = parse_sso_jwt_url(rsc_body)
+        if primary and primary not in hop_urls:
+            hop_urls.insert(0, primary)
+        if not hop_urls:
             if self.debug:
                 print("  [sso] no JWT set-cookie URL in RSC body")
-            return None
+            # Still try default grokusercontent endpoint in case body only had a JWT
+            jwt_only = re.search(
+                r'(eyJ[a-zA-Z0-9_-]+\.[a-zA-Z0-9_-]+\.[a-zA-Z0-9_-]+)',
+                _normalize_rsc_text(rsc_body or ""),
+            )
+            if jwt_only:
+                hop_urls = [
+                    f"https://auth.grokusercontent.com/set-cookie?q={jwt_only.group(1)}"
+                ]
+            else:
+                return None
 
         if self.debug:
-            print(f"  [sso] JWT URL: {sso_url[:80]}...")
+            print(f"  [sso] candidate hop URLs: {len(hop_urls)}")
+            for u in hop_urls[:5]:
+                print(f"  [sso]  - {u[:100]}")
 
-        # 2. decode the JWT to find the next hop (grokusercontent)
-        jwt = _extract_jwt_from_url(sso_url)
-        if not jwt:
-            if self.debug:
-                print("  [sso] could not extract JWT from URL")
-            return None
+        # 2. expand each hop with JWT success_url if present
+        expanded: List[str] = []
+        for sso_url in hop_urls:
+            if sso_url not in expanded:
+                expanded.append(sso_url)
+            jwt = _extract_jwt_from_url(sso_url)
+            if not jwt:
+                continue
+            success_url = self._resolve_success_url(jwt)
+            if success_url and success_url not in expanded:
+                expanded.append(success_url)
+        hop_urls = expanded
 
-        success_url = self._resolve_success_url(jwt)
-        if self.debug:
-            print(f"  [sso] success_url: {success_url[:80]}...")
-
-        # 3. hit set-cookie hops (original URL + success_url). Some deployments
-        # set the cookie on the first hop; others only on grokusercontent.
+        # 3. hit set-cookie hops. Some deployments set the cookie on the first hop;
+        # others only on grokusercontent; redirects may continue the chain.
         headers = self._base_headers()
         headers.update({
             "accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
@@ -261,14 +339,11 @@ class SSOExtractor:
             "sec-fetch-dest": "document",
             "referer": C.ACCOUNTS_ORIGIN + "/",
         })
-        hop_urls: List[str] = []
-        for u in (sso_url, success_url):
-            if u and u not in hop_urls:
-                hop_urls.append(u)
 
         set_cookies: List[str] = []
         last_exc: Optional[BaseException] = None
-        for hop in hop_urls:
+        token = None
+        for hop in list(hop_urls):
             for attempt in range(2):
                 try:
                     try:
@@ -285,10 +360,10 @@ class SSOExtractor:
                             f"  [sso] hop HTTP {_status} {hop[:64]}..., "
                             f"set-cookies={len(set_cookies or [])}"
                         )
-                    # Follow one redirect if present (303/302 often carries SSO)
+                    # Follow redirects if present (303/302 often carries SSO)
                     loc = ""
                     if isinstance(_hdrs, dict):
-                        loc = str(_hdrs.get("location") or "")
+                        loc = str(_hdrs.get("location") or _hdrs.get("Location") or "")
                     token = (
                         parse_sso_from_set_cookies(set_cookies or [])
                         or parse_sso_token_from_text(
@@ -298,8 +373,11 @@ class SSOExtractor:
                     )
                     if token:
                         break
-                    if loc.startswith("http") and loc not in hop_urls:
-                        hop_urls.append(loc)
+                    if loc:
+                        if loc.startswith("/"):
+                            loc = "https://accounts.x.ai" + loc
+                        if loc.startswith("http") and loc not in hop_urls:
+                            hop_urls.append(loc)
                     break
                 except Exception as exc:
                     last_exc = exc
