@@ -887,7 +887,7 @@
             </div>
             <div>
               <label>注册数量（多线程）</label>
-              <input id="reg-count" type="number" min="1" max="50" value="1" inputmode="numeric" />
+              <input id="reg-count" type="number" min="1" value="1" inputmode="numeric" />
             </div>
             <div>
               <label>并发数</label>
@@ -1971,7 +1971,7 @@ function buildRegBody(config) {
   const count = Number.parseInt(config.count || "1", 10);
   const concurrency = Number.parseInt(config.concurrency || "3", 10);
   const stagger = Number.parseInt(config.stagger_ms || "400", 10);
-  if (Number.isFinite(count) && count > 0) body.count = Math.min(50, count);
+  if (Number.isFinite(count) && count > 0) body.count = Math.floor(count);
   if (Number.isFinite(concurrency) && concurrency > 0) body.concurrency = Math.min(10, concurrency);
   if (Number.isFinite(stagger) && stagger >= 0) body.stagger_ms = Math.min(10000, stagger);
   return body;

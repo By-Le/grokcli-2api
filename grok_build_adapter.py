@@ -36,8 +36,8 @@ YESCAPTCHA_KEY = (
     or ""
 ).strip()
 
-# Hard caps for multi-thread registration (YesCaptcha + xAI rate limits).
-MAX_BATCH_COUNT = int(os.environ.get("GROK2API_REG_MAX_COUNT", "50") or 50)
+# Hard cap for multi-thread registration concurrency only (YesCaptcha + xAI rate limits).
+# Batch count is intentionally uncapped — only concurrency bounds parallelism.
 MAX_CONCURRENCY = int(os.environ.get("GROK2API_REG_MAX_CONCURRENCY", "10") or 10)
 DEFAULT_CONCURRENCY = int(os.environ.get("GROK2API_REG_CONCURRENCY", "3") or 3)
 
@@ -383,7 +383,7 @@ def start_registration(
         n = int(count if count is not None else 1)
     except (TypeError, ValueError):
         n = 1
-    n = max(1, min(n, MAX_BATCH_COUNT))
+    n = max(1, n)
 
     try:
         workers = int(

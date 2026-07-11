@@ -2,19 +2,49 @@
 
 把 **Grok OIDC 登录态** 转成 **OpenAI / Anthropic 兼容 API**，并附带 Web 管理台：多 API Key、多账号轮询、设备码 / 导入 / 协议注册。
 
-**当前版本：v1.8.19**
+**当前版本：v1.8.22**
 
 - **独立运行**：不依赖本地 Grok CLI，不调用 `grok login` / 浏览器 OAuth
 - **协议注册**：内置 `grok-build-auth`（HTTP 协议，无需 Chromium）
 - **中继友好**：兼容 new-api 操练场 / 测速（剥离不支持参数、reasoning 兼容、SSE keepalive）
 - **运维增强**：账号搜索、多选批量删除 / 续期 / 导出、多线程批量注册
 - **大账号池友好**：Token 自动续期 + 模型健康检查可常开，批处理 / 互斥 / 轻量状态接口
+- **长 tool 会话**：入站 history 压缩（旧 tool_result 摘要），缓解 Claude Code 多轮后 body 膨胀导致的 API Error
 
 适合 Cherry Studio、NextChat、OpenAI SDK、Anthropic SDK、Claude Code、Cursor、new-api 等工具接入。
 
 ---
 
-## 本次更新（v1.8.19）
+## 本次更新（v1.8.22）
+
+| 方向 | 内容 |
+|------|------|
+| 可选 | **History compact**（**默认关闭**）：长 Claude Code / sub2api 多轮 tool 会话可压缩旧 `tool` / `tool_result` |
+| 开启后 | 保留最近 **6** 轮完整 tool 结果；单条 tool 结果上限 **12KB**；messages JSON 预算 **~280KB** |
+| 协议 | 继续沿用 1.8.21 串行 tool SSE / dense index（sub2api `Content block not found` 防护） |
+| 观测 | 响应头 `X-Grok2API-History-Compact` / `Before` / `After` / `Tool-Rounds`（仅 compact 生效时） |
+| 配置 | `GROK2API_HISTORY_COMPACT=0`（默认）· 需要时再 `=1` + `KEEP_TOOL_ROUNDS` 等 |
+| 说明 | 默认**不**压缩工具上下文；开启后旧 tool 内容会被占位。**不能**消除 Grok free-usage 429 |
+
+### 历史（v1.8.21）
+
+| 方向 | 内容 |
+|------|------|
+| 修复 | Claude Code via **sub2api** 仍报 `API Error: Content block not found`（真实路径：CC `/v1/messages` → sub2api → grokcli `/v1/chat/completions`） |
+| 根因 | sub2api 把 OpenAI `delta.tool_calls[]` **同帧多 tool** 转成 Anthropic 时会并发 open 多个 content_block，且对 `Read` 会 buffer args 到 done；多 tool/交错 delta 时 stop/delta 打到非 active block |
+| 处理 | OpenAI 出站 **每帧最多 1 个完整 tool**（atomic id+name+完整 JSON args）；多 tool flush 拆成多条 SSE；dense index；hold 空 `{}`；Anthropic 路径串行 tool block |
+| 覆盖 | 主路径 OpenAI `/v1/chat/completions` 流（sub2api 实际走这条）+ Anthropic `/v1/messages` |
+
+### 历史（v1.8.20）
+
+| 方向 | 内容 |
+|------|------|
+| 修复 | 偶发 `API Error: Content block not found` / `content block not found`（多 tool 并行、空 `{}` 预览、incomplete tool 清空 hold） |
+| 根因 | 1. Anthropic 多 tool 同时 open block 0+1，Claude Code/sub2api 只认单个 active block；2. 上游先发 `arguments:"{}"` 被当完整 JSON 出站，后续真实参数无法再写；3. incomplete tool delta 就 clear 前言 hold |
+| 处理 | tool_use **串行** start→args→stop；live 路径不把空 `{}`/`[]` 当 ready；hold 仅在 **真实 tool block 出站** 后清除；finish 同样一工具一开关 |
+| 覆盖 | Anthropic `/v1/messages` 流 + OpenAI tool 参数门控 |
+
+### 历史（v1.8.19）
 
 | 方向 | 内容 |
 |------|------|
@@ -48,6 +78,12 @@
 cp .env.example .env
 # off（默认）: reasoning 走 reasoning_content，正文不带 <think>
 GROK2API_REASONING_COMPAT=off
+# 长 tool 会话压缩（默认关闭，保留完整工具上下文）
+# GROK2API_HISTORY_COMPACT=0
+# 仅在 body 过大/超时时再打开：
+# GROK2API_HISTORY_COMPACT=1
+# GROK2API_HISTORY_KEEP_TOOL_ROUNDS=6
+# GROK2API_HISTORY_MAX_MESSAGES_CHARS=280000
 ```
 
 ---
@@ -418,8 +454,7 @@ cp .env.example .env
 | `GROK2API_YESCAPTCHA_KEY` / `YESCAPTCHA_API_KEY` | 空 | YesCaptcha Key |
 | `GROK2API_YESCAPTCHA_ENDPOINT` | 官方默认 | 打码接口 |
 | `GROK2API_YESCAPTCHA_TIMEOUT` | `180` | 打码超时（秒） |
-| `GROK2API_REG_MAX_COUNT` | `50` | 批量注册数量上限 |
-| `GROK2API_REG_MAX_CONCURRENCY` | `10` | 并发上限 |
+| `GROK2API_REG_MAX_CONCURRENCY` | `10` | 并发上限（注册数量不设硬上限，仅限线程） |
 | `GROK2API_REG_CONCURRENCY` | `3` | 默认并发 |
 | `GROK2API_XAI_PROXY` | 空 | 注册/上游可选代理 |
 

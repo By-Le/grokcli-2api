@@ -136,8 +136,7 @@ class EmailRegistrationBody(BaseModel):
     count: int | None = Field(
         default=1,
         ge=1,
-        le=50,
-        description="How many accounts to register (batch/multi-thread)",
+        description="How many accounts to register (batch/multi-thread; no hard cap, concurrency limits parallelism)",
     )
     concurrency: int | None = Field(
         default=3,
