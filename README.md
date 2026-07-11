@@ -17,82 +17,10 @@
 
 ## 本次更新（v1.8.23）
 
-| 方向 | 内容 |
-|------|------|
-| 可选 | **History compact**（**默认关闭**）：长 Claude Code / sub2api 多轮 tool 会话可压缩旧 `tool` / `tool_result` |
-| 开启后 | 保留最近 **6** 轮完整 tool 结果；单条 tool 结果上限 **12KB**；messages JSON 预算 **~280KB** |
-| 协议 | 出站 **每帧最多 1 个完整 tool** + dense index；Anthropic 路径 tool block 串行 start→args→stop |
-| 上游 | 内置搜索映射到 xAI `live_search`（兼容 `web_search` / `web_search_preview` 别名） |
-| 观测 | 响应头 `X-Grok2API-History-Compact` / `Before` / `After` / `Tool-Rounds` |
-| 配置 | `GROK2API_HISTORY_COMPACT=0`（默认）· 需要时再 `=1` + `KEEP_TOOL_ROUNDS` 等 |
-| 说明 | 默认**不**压缩工具上下文；开启后旧 tool 内容会被占位。**不能**消除 Grok free-usage 429 |
-
-### 历史（v1.8.22）
-
-| 方向 | 内容 |
-|------|------|
-| 可选 | 引入 History compact 开关与响应头观测（默认关闭） |
-| 协议 | 串行 tool SSE / dense index 加固（sub2api `Content block not found`） |
-
-### 历史（v1.8.21）
-
-| 方向 | 内容 |
-|------|------|
-| 修复 | Claude Code via **sub2api** 仍报 `API Error: Content block not found`（真实路径：CC `/v1/messages` → sub2api → grokcli `/v1/chat/completions`） |
-| 根因 | sub2api 把 OpenAI `delta.tool_calls[]` **同帧多 tool** 转成 Anthropic 时会并发 open 多个 content_block，且对 `Read` 会 buffer args 到 done；多 tool/交错 delta 时 stop/delta 打到非 active block |
-| 处理 | OpenAI 出站 **每帧最多 1 个完整 tool**（atomic id+name+完整 JSON args）；多 tool flush 拆成多条 SSE；dense index；hold 空 `{}`；Anthropic 路径串行 tool block |
-| 覆盖 | 主路径 OpenAI `/v1/chat/completions` 流（sub2api 实际走这条）+ Anthropic `/v1/messages` |
-
-### 历史（v1.8.20）
-
-| 方向 | 内容 |
-|------|------|
-| 修复 | 偶发 `API Error: Content block not found` / `content block not found`（多 tool 并行、空 `{}` 预览、incomplete tool 清空 hold） |
-| 根因 | 1. Anthropic 多 tool 同时 open block 0+1，Claude Code/sub2api 只认单个 active block；2. 上游先发 `arguments:"{}"` 被当完整 JSON 出站，后续真实参数无法再写；3. incomplete tool delta 就 clear 前言 hold |
-| 处理 | tool_use **串行** start→args→stop；live 路径不把空 `{}`/`[]` 当 ready；hold 仅在 **真实 tool block 出站** 后清除；finish 同样一工具一开关 |
-| 覆盖 | Anthropic `/v1/messages` 流 + OpenAI tool 参数门控 |
-
-### 历史（v1.8.19）
-
-| 方向 | 内容 |
-|------|------|
-| 修复 | Claude Code / sub2api 仍报 `apiError: Content block not found`（incomplete tool 预览后泄漏正文 / 稀疏 index） |
-| 根因 | 1.8.18 在上游 tool delta **未真正出站** 时就把 `saw_tool_calls=True` 并丢弃缓冲；同时允许 tool 后 trailing content，且保留稀疏 `tool_calls.index`，sub2api 仍会把 text 开成 block 0 或跳过 block 0 |
-| 处理 | 仅在 **实际发出 tool 帧** 后判定 tools 胜出；tools 出站后抑制全部 content/reasoning；出站 tool index **稠密重编号 0..n-1**；Anthropic `/v1/messages` 同步 hold 前言 |
-| 覆盖 | OpenAI `/v1/chat/completions` 流 + Anthropic `/v1/messages` 流 |
-
-### 历史（v1.8.18）
-
-| 方向 | 内容 |
-|------|------|
-| 修复 | Claude Code / sub2api 仍报 `apiError: Content block not found`（Grok 先 reasoning 再 tool） |
-| 处理 | OpenAI 出站缓冲 pre-tool content/reasoning；出现 tool_calls 后丢弃前言 |
-
-### 历史（v1.8.17）
-
-| 方向 | 内容 |
-|------|------|
-| 修复 | 真 delta JSON 标量 `"file_path"` 误判完整；高 index 抢占 content_block 0 |
-
-### 历史（v1.8.16）
-
-| 方向 | 内容 |
-|------|------|
-| 修复 | name-only 预占 index、content/tool 混帧、完整 JSON 原子出站 |
-
-### 相关环境变量（可选）
-
-```bash
-cp .env.example .env
-# off（默认）: reasoning 走 reasoning_content，正文不带 <think>
-GROK2API_REASONING_COMPAT=off
-# 长 tool 会话压缩（默认关闭，保留完整工具上下文）
-# GROK2API_HISTORY_COMPACT=0
-# 仅在 body 过大/超时时再打开：
-# GROK2API_HISTORY_COMPACT=1
-# GROK2API_HISTORY_KEEP_TOOL_ROUNDS=6
-# GROK2API_HISTORY_MAX_MESSAGES_CHARS=280000
-```
+- **History compact**（默认关闭）：长 Claude Code / sub2api 多轮 tool 会话可压缩旧 `tool` / `tool_result`
+- 出站 **每帧最多 1 个完整 tool** + dense index；Anthropic 路径串行 tool block
+- 内置搜索映射到 xAI `live_search`（兼容 `web_search` / `web_search_preview`）
+- 可选配置：`GROK2API_HISTORY_COMPACT=1`、`GROK2API_HISTORY_KEEP_TOOL_ROUNDS=6` 等（见 `.env.example`）
 
 ---
 
