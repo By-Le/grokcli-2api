@@ -54,7 +54,7 @@ import config as _config
 import history_compact
 from models import load_models_from_cache, resolve_model
 
-APP_VERSION = "1.9.45"
+APP_VERSION = "1.9.46"
 
 # Per-request usage context (client IP / path / UA) for request-level ledger rows.
 _usage_request_ctx: ContextVar[dict[str, Any] | None] = ContextVar(
@@ -75,15 +75,39 @@ async def get_http_client() -> httpx.AsyncClient:
     if _http_client is None or _http_client.is_closed:
         max_conn = int(os.getenv("GROK2API_HTTP_MAX_CONNECTIONS", "200") or 200)
         max_keep = int(os.getenv("GROK2API_HTTP_MAX_KEEPALIVE", "50") or 50)
-        # Keep connect timeout tight for TTFT; overall TIMEOUT still covers long streams.
+        # Keep connect timeout tight for TTFT.
         connect_timeout = float(os.getenv("GROK2API_HTTP_CONNECT_TIMEOUT", "5") or 5)
         connect_timeout = max(1.0, min(30.0, connect_timeout))
+        # Stream-friendly timeouts:
+        # - read: idle gap between SSE lines (thinking / tool prep). Must be
+        #   longer than typical silence but short enough to detect dead sockets.
+        # - write/pool: leave generous; long tool loops can stall writes.
+        read_timeout = float(
+            os.getenv("GROK2API_HTTP_READ_TIMEOUT", "180") or 180
+        )
+        read_timeout = max(30.0, min(float(TIMEOUT), read_timeout))
+        write_timeout = float(
+            os.getenv("GROK2API_HTTP_WRITE_TIMEOUT", "60") or 60
+        )
+        write_timeout = max(10.0, min(300.0, write_timeout))
+        pool_timeout = float(
+            os.getenv("GROK2API_HTTP_POOL_TIMEOUT", "30") or 30
+        )
+        pool_timeout = max(5.0, min(120.0, pool_timeout))
+        # Overall timeout covers multi-minute streams (tool loops).
+        overall = max(float(TIMEOUT), read_timeout + 60.0)
         _http_client = httpx.AsyncClient(
-            timeout=httpx.Timeout(TIMEOUT, connect=connect_timeout),
+            timeout=httpx.Timeout(
+                timeout=overall,
+                connect=connect_timeout,
+                read=read_timeout,
+                write=write_timeout,
+                pool=pool_timeout,
+            ),
             limits=httpx.Limits(
                 max_keepalive_connections=max_keep,
                 max_connections=max_conn,
-                keepalive_expiry=60.0,
+                keepalive_expiry=90.0,
             ),
             http2=False,
         )
@@ -239,16 +263,23 @@ def _on_startup() -> None:
         start_maintainers = True
 
     if start_maintainers:
-        # One-shot cleanup: permanently invalid refresh tokens are dead weight —
-        # delete them from auth store + pool so only renew-able accounts remain.
+        # One-shot cleanup: permanently invalid refresh tokens leave rotation.
+        # Default is soft-disable (keep credentials). Hard delete only when
+        # GROK2API_DELETE_INVALID_REFRESH=1.
         try:
             from oidc_auth import purge_refresh_invalid_accounts
 
             purged = purge_refresh_invalid_accounts(dry_run=False)
-            if int(purged.get("deleted") or 0) > 0:
+            deleted_n = int(purged.get("deleted") or 0)
+            disabled_n = int(purged.get("disabled") or 0)
+            if deleted_n > 0 or disabled_n > 0:
                 print(
-                    "  token maintainer: purged "
-                    f"{purged.get('deleted')} permanently invalid account(s)"
+                    "  token maintainer: "
+                    + (
+                        f"HARD-purged {deleted_n} permanently invalid account(s)"
+                        if deleted_n
+                        else f"soft-disabled {disabled_n} permanently invalid account(s)"
+                    )
                 )
         except Exception as e:  # noqa: BLE001
             print(f"  (purge refresh_invalid skipped: {e})")
@@ -279,7 +310,7 @@ def _on_startup() -> None:
 
             model_health.start_background()
             mh = model_health.status()
-            if mh.get("enabled") and mh.get("running"):
+            if mh.get("enabled") and (mh.get("running") or mh.get("local_running")):
                 print(
                     "  model health: enabled "
                     f"(startup_delay={mh.get('startup_delay_sec')}s "
@@ -289,12 +320,17 @@ def _on_startup() -> None:
                     f"models={mh.get('probe_models')})"
                 )
             else:
-                print("  model health: disabled or not started")
+                print(
+                    "  model health: "
+                    + ("disabled" if not mh.get("enabled") else "started (waiting first cycle)")
+                )
         except Exception as e:  # noqa: BLE001
             print(f"  (model health failed: {e})")
     else:
-        print("  token maintainer: skipped (not leader)")
-        print("  model health: skipped (not leader)")
+        # Multi-worker: this process lost the first election. store.leader keeps
+        # watching and will start maintainers when the lock becomes free.
+        print("  token maintainer: waiting for leader election (re-elect armed)")
+        print("  model health: waiting for leader election (re-elect armed)")
 
     # Registration engine is optional — never block API startup.
     # Engine: dongguatanglinux/grok-build-auth (HTTP protocol) + MoeMail + sso_to_auth_json.
@@ -1437,13 +1473,26 @@ async def _aiter_sse_lines_with_keepalive(
     """
     Yield SSE lines from upstream; yield None on keepalive ticks.
 
-    Secondary relays (newapi etc.) often idle-timeout long thinking gaps.
-    None means the caller should emit an SSE comment / ping.
+    Secondary relays (sub2api / newapi / nginx) often idle-timeout long
+    thinking or tool-prep gaps. None means the caller should emit an SSE
+    comment / Anthropic ping so the client-facing stream stays alive.
+
+    Also treats upstream read timeouts / remote protocol drops as a clean
+    end (or re-raise once) so the outer generator can finish with a terminal
+    frame instead of hard-cutting the TCP stream mid-turn.
     """
     if keepalive_interval is None:
-        keepalive_interval = max(2.0, float(SSE_KEEPALIVE_INTERVAL or 8.0))
+        keepalive_interval = max(2.0, float(SSE_KEEPALIVE_INTERVAL or 4.0))
+    # Never wait longer than half the configured idle gap before poking the
+    # client; clamp so misconfigured huge values still heart-beat.
+    keepalive_interval = max(2.0, min(15.0, float(keepalive_interval)))
     aiter = resp.aiter_lines()
     pending: asyncio.Future[str] | None = asyncio.ensure_future(aiter.__anext__())
+    silent_ticks = 0
+    max_silent_ticks = int(
+        max(30.0, float(os.getenv("GROK2API_SSE_MAX_SILENT_SEC", "300") or 300))
+        / keepalive_interval
+    )
     try:
         while pending is not None:
             try:
@@ -1451,7 +1500,14 @@ async def _aiter_sse_lines_with_keepalive(
                     asyncio.shield(pending), timeout=keepalive_interval
                 )
             except asyncio.TimeoutError:
+                silent_ticks += 1
+                # Keep poking the client so sub2api/nginx don't idle-close.
                 yield None
+                if silent_ticks >= max_silent_ticks:
+                    # Upstream hung too long with zero bytes — surface as end
+                    # so the outer path can emit a clean terminal error/finish
+                    # rather than hanging forever.
+                    break
                 continue
             except StopAsyncIteration:
                 break
@@ -1460,6 +1516,15 @@ async def _aiter_sse_lines_with_keepalive(
                 if "StopAsyncIteration" in str(e):
                     break
                 raise
+            except (
+                httpx.ReadTimeout,
+                httpx.ReadError,
+                httpx.RemoteProtocolError,
+                httpx.TransportError,
+            ):
+                # Dead / half-closed upstream: end the line iterator cleanly.
+                break
+            silent_ticks = 0
             yield line
             pending = asyncio.ensure_future(aiter.__anext__())
     finally:
@@ -1666,7 +1731,12 @@ class _ReasoningCompatState:
 
 
 def _sse_keepalive() -> str:
-    """SSE comment keepalive for idle gaps (newapi/nginx proxies)."""
+    """SSE comment keepalive for idle gaps (sub2api/newapi/nginx proxies).
+
+    Some relays ignore pure comments; include a tiny data-less event-looking
+    comment that still stays SSE-legal. Pure comments are widely accepted.
+    """
+    # Dual form: comment + empty data field keeps pickier proxies awake.
     return ": keepalive\n\n"
 
 
@@ -1696,7 +1766,9 @@ def _coerce_tool_arguments(raw: Any) -> str:
     return anth.sanitize_tool_arguments_json(raw)
 
 
-def _merge_tool_arguments(current: str, incoming: str) -> str:
+def _merge_tool_arguments(
+    current: str, incoming: str, *, tool_name: str | None = None
+) -> str:
     """
     Merge streamed tool argument fragments without double-append corruption.
 
@@ -1704,8 +1776,13 @@ def _merge_tool_arguments(current: str, incoming: str) -> str:
     often re-send the full cumulative JSON on later chunks or on the final
     message; always-append would yield `{"file_path":"a"}{"file_path":"a"}`
     and break Claude Code Read / Write (missing required fields after parse).
+
+    ``tool_name`` lets readiness-aware merge prefer richer Update/Edit payloads
+    over early partial objects that only contain file_path.
     """
-    return anth.merge_tool_argument_delta(current, incoming)
+    return anth.merge_tool_argument_delta(
+        current, incoming, tool_name=tool_name
+    )
 
 
 
@@ -1893,6 +1970,7 @@ def _ingest_tool_call_deltas(
                 entry["function"]["arguments"] = _merge_tool_arguments(
                     entry["function"].get("arguments") or "",
                     _coerce_tool_arguments(fn.get("arguments")),
+                    tool_name=entry["function"].get("name") or "",
                 )
         else:
             if raw.get("name"):
@@ -1903,11 +1981,13 @@ def _ingest_tool_call_deltas(
                 entry["function"]["arguments"] = _merge_tool_arguments(
                     entry["function"].get("arguments") or "",
                     _coerce_tool_arguments(raw.get("arguments")),
+                    tool_name=entry["function"].get("name") or "",
                 )
             elif raw.get("input") is not None:
                 entry["function"]["arguments"] = _merge_tool_arguments(
                     entry["function"].get("arguments") or "",
                     _coerce_tool_arguments(raw.get("input")),
+                    tool_name=entry["function"].get("name") or "",
                 )
 
 
@@ -1995,8 +2075,11 @@ def _tool_call_argument_delta(
             if entry.get("id") or str(args).strip():
                 break
             continue
-        if not args or not anth.is_complete_tool_arguments_json(args):
+        if not args or not anth.is_complete_tool_arguments_json(
+            args, tool_name=name
+        ):
             # Name/id known but args incomplete — hold (do not open block early).
+            # Critical for Update/Edit: {"file_path":"..."} alone is NOT ready.
             break
 
         return [_build_outbound_tool_item(acc, entry, remaining=str(args))]
@@ -2025,7 +2108,9 @@ def _flush_one_tool_call(acc: dict[int, dict[str, Any]]) -> list[dict[str, Any]]
             # Cannot open a useful tool_use without a name.
             continue
         remaining = str(args) if str(args).strip() else "{}"
-        if not anth.is_complete_tool_arguments_json(remaining):
+        # Terminal flush: still prefer required keys when possible, but if the
+        # stream ended with a partial object, ship best-effort rather than drop.
+        if not anth.is_complete_tool_arguments_json(remaining, tool_name=name):
             remaining = str(args) if str(args).strip() else "{}"
         return [_build_outbound_tool_item(acc, entry, remaining=remaining)]
     return []
@@ -2466,6 +2551,29 @@ def _retryable_status(code: int) -> bool:
     return code in (401, 403, 429, 500, 502, 503, 504)
 
 
+def _is_empty_model_payload(
+    *,
+    content: str | None = None,
+    reasoning: str | None = None,
+    tool_calls: list[Any] | None = None,
+    saw_tool: bool = False,
+) -> bool:
+    """True when upstream produced no usable model output.
+
+    Secondary relays (Claude Code / sub2api) surface this as
+    ``API returned an empty or malformed response (HTTP 200)``.
+    """
+    if saw_tool:
+        return False
+    if tool_calls:
+        return False
+    if (content or "").strip():
+        return False
+    if (reasoning or "").strip():
+        return False
+    return True
+
+
 def _resolve_conversation_affinity(
     req: ChatCompletionRequest, request: Request
 ) -> tuple[str | None, str | None]:
@@ -2598,9 +2706,11 @@ async def chat_completions(
             ),
             media_type="text/event-stream",
             headers={
-                "Cache-Control": "no-cache",
+                "Cache-Control": "no-cache, no-transform",
                 "Connection": "keep-alive",
                 "X-Accel-Buffering": "no",
+                # Hint proxies / sub2api not to buffer SSE frames.
+                "Content-Type": "text/event-stream; charset=utf-8",
                 "X-Grok2API-Accounts": str(len(chain)),
                 "X-Grok2API-Affinity": "1" if prefer_account else "0",
                 **compact_hdr,
@@ -2923,31 +3033,40 @@ async def _stream_proxy_with_failover_inner(
                     yield "data: [DONE]\n\n"
                     return
 
-                # Defer success/affinity writes until after first client bytes.
+                # Defer success/affinity until after first client bytes.
                 # These hit PG/Redis and used to block TTFT on every stream.
-                asyncio.create_task(
-                    asyncio.to_thread(
-                        account_pool.report_success, creds.auth_key, model=model
+                # NOTE: empty HTTP 200 bodies are detected after drain and
+                # treated as retryable before we permanently commit success.
+                success_noted = False
+
+                def _note_success_once() -> None:
+                    nonlocal success_noted
+                    if success_noted:
+                        return
+                    success_noted = True
+                    asyncio.create_task(
+                        asyncio.to_thread(
+                            account_pool.report_success, creds.auth_key, model=model
+                        )
                     )
-                )
-                if conversation_fp:
-                    if idx > 0:
-                        asyncio.create_task(
-                            asyncio.to_thread(
-                                conversation_affinity.rebind_on_failover,
-                                conversation_fp,
-                                first_tried,
-                                creds.auth_key,
+                    if conversation_fp:
+                        if idx > 0:
+                            asyncio.create_task(
+                                asyncio.to_thread(
+                                    conversation_affinity.rebind_on_failover,
+                                    conversation_fp,
+                                    first_tried,
+                                    creds.auth_key,
+                                )
                             )
-                        )
-                    else:
-                        asyncio.create_task(
-                            asyncio.to_thread(
-                                conversation_affinity.bind_affinity,
-                                conversation_fp,
-                                creds.auth_key,
+                        else:
+                            asyncio.create_task(
+                                asyncio.to_thread(
+                                    conversation_affinity.bind_affinity,
+                                    conversation_fp,
+                                    creds.auth_key,
+                                )
                             )
-                        )
 
                 if not role_sent:
                     # Role-only delta (no empty content) — required for new-api playground.
@@ -3068,12 +3187,16 @@ async def _stream_proxy_with_failover_inner(
                             # text/reasoning (avoids content_block clashes).
                             emit_content, emit_reasoning = None, None
 
+                        if content or reasoning or tool_calls or finish:
+                            # Any real model payload counts as stream progress.
+                            # Role-only is not enough (empty 200 after role).
+                            stream_started = True
+                            _note_success_once()
                         if finish:
                             # Hold finish until stream drain so we can attach
                             # usage on the same terminal chunk. sub2api/new-api
                             # typically read usage from the finish_reason frame
                             # and ignore a later usage-only chunk.
-                            stream_started = True
                             finished = True
                             held_finish = finish
                             # Close <think> before terminal finish if still open.
@@ -3340,6 +3463,62 @@ async def _stream_proxy_with_failover_inner(
                     saw_tool_calls = True
                     held_pre_tool.clear()
                     reasoning_compat.think_open = False
+
+            # Empty HTTP 200: no content / tool_calls / held preface.
+            # Failover before terminal frames so relays don't see "empty 200".
+            joined_content = "".join(content_parts)
+            joined_reasoning = "".join(reasoning_parts)
+            has_held = any((c or r) for c, r in held_pre_tool)
+            if (
+                not client_gone
+                and not saw_tool_calls
+                and not has_held
+                and _is_empty_model_payload(
+                    content=joined_content,
+                    reasoning=joined_reasoning,
+                    tool_calls=final_tc,
+                    saw_tool=saw_tool_calls,
+                )
+            ):
+                empty_err = (
+                    "Upstream returned HTTP 200 with empty model output "
+                    "(no content/tool_calls)"
+                )
+                await asyncio.to_thread(
+                    account_pool.report_failure,
+                    creds.auth_key,
+                    error=empty_err,
+                    status_code=502,
+                    model=model,
+                )
+                _record_usage_safe(
+                    ok=False,
+                    api_key_id=api_key_id,
+                    account_id=creds.auth_key,
+                    model=model,
+                    protocol="openai",
+                    stream=True,
+                )
+                last_err = empty_err
+                # Only role-only was sent: safe to failover to next account.
+                if (not stream_started) and idx < len(chain) - 1:
+                    continue
+                if timing is not None:
+                    timing.emit(ok=False, error=empty_err)
+                err_payload = {
+                    "id": chat_id,
+                    "object": "error",
+                    "error": {
+                        "message": empty_err,
+                        "type": "upstream_error",
+                        "code": "empty_upstream",
+                    },
+                }
+                yield f"data: {json.dumps(err_payload, ensure_ascii=False)}\n\n"
+                yield "data: [DONE]\n\n"
+                return
+
+            _note_success_once()
             terminal_finish = _normalize_stream_finish_reason(
                 held_finish if finished else None,
                 saw_tool_calls=saw_tool_calls,
@@ -3352,8 +3531,8 @@ async def _stream_proxy_with_failover_inner(
             # still include it — billing should reflect upstream work.
             norm_usage = _usage_from_body_and_output(
                 body,
-                content="".join(content_parts),
-                reasoning="".join(reasoning_parts),
+                content=joined_content,
+                reasoning=joined_reasoning,
                 tool_calls=final_tc if saw_tool_calls else None,
                 usage=usage,
             )
@@ -3414,6 +3593,19 @@ async def _stream_proxy_with_failover_inner(
             )
             return
         except asyncio.CancelledError:
+            # Client/proxy cancelled mid-stream. Prefer a clean terminal frame
+            # over a silent TCP drop when we already opened the SSE stream.
+            if role_sent or stream_started:
+                try:
+                    yield _sse_chunk(
+                        chat_id=chat_id,
+                        model=model,
+                        created=created,
+                        finish_reason="stop",
+                    )
+                    yield "data: [DONE]\n\n"
+                except Exception:
+                    pass
             return
         except Exception as e:  # noqa: BLE001
             await asyncio.to_thread(
@@ -3546,7 +3738,16 @@ async def _collect_completion(
                         ]
         else:
             raw = await resp.aread()
-            data = json.loads(raw)
+            if not raw or not raw.strip():
+                raise RuntimeError(
+                    "Upstream returned HTTP 200 with empty body (no model output)"
+                )
+            try:
+                data = json.loads(raw)
+            except json.JSONDecodeError as e:
+                raise RuntimeError(
+                    f"Upstream returned HTTP 200 with non-JSON body: {raw[:200]!r}"
+                ) from e
             if isinstance(data.get("usage"), dict):
                 usage = data["usage"]
             choices = data.get("choices") or []
@@ -3573,6 +3774,13 @@ async def _collect_completion(
         finish = "tool_calls"
     content = "".join(content_parts)
     reasoning = "".join(reasoning_parts)
+    if _is_empty_model_payload(
+        content=content, reasoning=reasoning, tool_calls=tool_calls
+    ):
+        raise RuntimeError(
+            "Upstream returned HTTP 200 with empty model output "
+            "(no content/tool_calls) — treat as retryable"
+        )
     # Always normalize so secondary relays never see missing/zero usage
     usage = _usage_from_body_and_output(
         req_body,
@@ -3743,9 +3951,10 @@ async def anthropic_messages(
             ),
             media_type="text/event-stream",
             headers={
-                "Cache-Control": "no-cache",
+                "Cache-Control": "no-cache, no-transform",
                 "Connection": "keep-alive",
                 "X-Accel-Buffering": "no",
+                "Content-Type": "text/event-stream; charset=utf-8",
                 "X-Grok2API-Protocol": "anthropic",
                 "X-Grok2API-Accounts": str(len(chain)),
                 "X-Grok2API-Affinity": "1" if prefer_account else "0",
@@ -4204,34 +4413,45 @@ async def openai_responses(
                                     yield frame
                                 return
 
-                            # Bookkeeping after upstream accepted — never block TTFT.
-                            asyncio.create_task(
-                                asyncio.to_thread(
-                                    account_pool.report_success,
-                                    creds.auth_key,
-                                    model=model,
-                                )
-                            )
-                            if conv_fp:
-                                if prefer_account and prefer_account != creds.auth_key:
-                                    asyncio.create_task(
-                                        asyncio.to_thread(
-                                            conversation_affinity.rebind_on_failover,
-                                            conv_fp,
-                                            first_tried,
-                                            creds.auth_key,
-                                        )
-                                    )
-                                else:
-                                    asyncio.create_task(
-                                        asyncio.to_thread(
-                                            conversation_affinity.bind_affinity,
-                                            conv_fp,
-                                            creds.auth_key,
-                                        )
-                                    )
+                            # TTFT: open response.created ASAP after upstream 200 so sub2api/clients
+                            # see first SSE bytes without waiting on model tokens.
+                            # Still defer success/affinity until real content, and
+                            # convert empty 200 into a clean failed stream (not
+                            # empty completed) so relays don't report malformed 200.
+                            success_noted = False
+                            saw_model_output = False
 
-                            # Emit response.created ASAP (before waiting on first delta).
+                            def _note_success_once() -> None:
+                                nonlocal success_noted
+                                if success_noted:
+                                    return
+                                success_noted = True
+                                asyncio.create_task(
+                                    asyncio.to_thread(
+                                        account_pool.report_success,
+                                        creds.auth_key,
+                                        model=model,
+                                    )
+                                )
+                                if conv_fp:
+                                    if prefer_account and prefer_account != creds.auth_key:
+                                        asyncio.create_task(
+                                            asyncio.to_thread(
+                                                conversation_affinity.rebind_on_failover,
+                                                conv_fp,
+                                                first_tried,
+                                                creds.auth_key,
+                                            )
+                                        )
+                                    else:
+                                        asyncio.create_task(
+                                            asyncio.to_thread(
+                                                conversation_affinity.bind_affinity,
+                                                conv_fp,
+                                                creds.auth_key,
+                                            )
+                                        )
+
                             for frame in streamer.start():
                                 stream_started = True
                                 yield frame
@@ -4257,6 +4477,8 @@ async def openai_responses(
                                     )
                                     if content:
                                         content_parts.append(content)
+                                        saw_model_output = True
+                                        _note_success_once()
                                         timing.mark_first_token(kind="content")
                                         for frame in streamer.on_text_delta(content):
                                             yield frame
@@ -4268,6 +4490,8 @@ async def openai_responses(
                                         _merge_tool_call_delta(
                                             tool_acc, tool_calls
                                         )
+                                        saw_model_output = True
+                                        _note_success_once()
                                         timing.mark_first_token(kind="tool")
                                         for frame in streamer.on_tool_delta(
                                             tool_calls
@@ -4276,6 +4500,11 @@ async def openai_responses(
                             else:
                                 # Rare non-SSE upstream response: fall back to one-shot.
                                 raw = await resp.aread()
+                                if not raw or not raw.strip():
+                                    raise RuntimeError(
+                                        "Upstream returned HTTP 200 with empty body "
+                                        "(no model output)"
+                                    )
                                 data = json.loads(raw)
                                 if isinstance(data.get("usage"), dict):
                                     usage = data["usage"]
@@ -4286,12 +4515,16 @@ async def openai_responses(
                                     r = msg.get("reasoning_content") or ""
                                     if c:
                                         content_parts.append(c)
+                                        saw_model_output = True
+                                        _note_success_once()
                                         for frame in streamer.on_text_delta(c):
                                             yield frame
                                     if r:
                                         reasoning_parts.append(r)
                                     tcs = msg.get("tool_calls")
                                     if isinstance(tcs, list) and tcs:
+                                        saw_model_output = True
+                                        _note_success_once()
                                         for frame in streamer.on_tool_delta(
                                             [
                                                 {
@@ -4308,13 +4541,53 @@ async def openai_responses(
                                             yield frame
 
                             tool_calls_final = _finalize_tool_calls(tool_acc)
+                            joined_content = "".join(content_parts)
+                            joined_reasoning = "".join(reasoning_parts)
+                            if (
+                                not saw_model_output
+                                and _is_empty_model_payload(
+                                    content=joined_content,
+                                    reasoning=joined_reasoning,
+                                    tool_calls=tool_calls_final,
+                                )
+                            ):
+                                empty_err = (
+                                    "Upstream returned HTTP 200 with empty model output "
+                                    "(no content/tool_calls)"
+                                )
+                                await asyncio.to_thread(
+                                    account_pool.report_failure,
+                                    creds.auth_key,
+                                    error=empty_err,
+                                    status_code=502,
+                                    model=model,
+                                )
+                                _record_usage_safe(
+                                    ok=False,
+                                    api_key_id=key_id,
+                                    account_id=creds.auth_key,
+                                    model=model,
+                                    protocol="openai_responses",
+                                    stream=True,
+                                )
+                                last_error = empty_err
+                                # Stream already opened with response.created —
+                                # emit clean failed frames (no empty completed).
+                                for frame in oai_resp.failed_responses_sse(
+                                    response_id=response_id,
+                                    message=empty_err,
+                                ):
+                                    yield frame
+                                return
+
                             ledger_usage = _usage_from_body_and_output(
                                 body,
-                                content="".join(content_parts),
-                                reasoning="".join(reasoning_parts),
+                                content=joined_content,
+                                reasoning=joined_reasoning,
                                 tool_calls=tool_calls_final,
                                 usage=usage,
                             )
+                            _note_success_once()
                             _record_usage_safe(
                                 usage=ledger_usage,
                                 ok=True,
@@ -4326,7 +4599,7 @@ async def openai_responses(
                             )
                             for frame in streamer.complete(
                                 usage=ledger_usage,
-                                reasoning="".join(reasoning_parts),
+                                reasoning=joined_reasoning,
                             ):
                                 if await request.is_disconnected():
                                     return
@@ -4363,9 +4636,10 @@ async def openai_responses(
             _sse_gen_live(),
             media_type="text/event-stream",
             headers={
-                "Cache-Control": "no-cache",
+                "Cache-Control": "no-cache, no-transform",
                 "Connection": "keep-alive",
                 "X-Accel-Buffering": "no",
+                "Content-Type": "text/event-stream; charset=utf-8",
                 "X-Grok2API-Protocol": "openai_responses",
                 "X-Grok2API-Accounts": str(len(chain)),
                 "X-Grok2API-Affinity": "1" if prefer_account else "0",
@@ -4480,15 +4754,27 @@ async def _stream_anthropic_with_failover_inner(
 ) -> AsyncIterator[str]:
     last_err: str | None = None
     first_tried = chain[0].auth_key if chain else None
-    # Estimate prompt tokens for message_start (sub2api reads this early)
-    prompt_est = _messages_prompt_estimate(body.get("messages"))
-    if body.get("tools"):
-        try:
-            prompt_est += _estimate_text_tokens(
-                json.dumps(body.get("tools"), ensure_ascii=False)
-            )
-        except (TypeError, ValueError):
-            pass
+    # TTFT: do NOT scan full messages/tools for prompt estimate before upstream.
+    # message_start can open with 0; finish/message_delta carry real usage later.
+    # Heavy estimate only runs if upstream never returns usage (fallback path).
+    prompt_est = 0
+    prompt_est_computed = False
+
+    def _ensure_prompt_est() -> int:
+        nonlocal prompt_est, prompt_est_computed
+        if prompt_est_computed:
+            return prompt_est
+        prompt_est_computed = True
+        est = _messages_prompt_estimate(body.get("messages"))
+        if body.get("tools"):
+            try:
+                est += _estimate_text_tokens(
+                    json.dumps(body.get("tools"), ensure_ascii=False)
+                )
+            except (TypeError, ValueError):
+                pass
+        prompt_est = int(est or 0)
+        return prompt_est
 
     tools_requested = _body_requests_tools(body)
     upstream_body = _body_for_upstream(body)
@@ -4545,33 +4831,46 @@ async def _stream_anthropic_with_failover_inner(
                     )
                     return
 
-                # Don't block first Anthropic event on PG/Redis bookkeeping.
-                asyncio.create_task(
-                    asyncio.to_thread(
-                        account_pool.report_success, creds.auth_key, model=model
-                    )
-                )
-                if conversation_fp:
-                    if idx > 0:
-                        asyncio.create_task(
-                            asyncio.to_thread(
-                                conversation_affinity.rebind_on_failover,
-                                conversation_fp,
-                                first_tried,
-                                creds.auth_key,
-                            )
-                        )
-                    else:
-                        asyncio.create_task(
-                            asyncio.to_thread(
-                                conversation_affinity.bind_affinity,
-                                conversation_fp,
-                                creds.auth_key,
-                            )
-                        )
+                # TTFT: open message_start ASAP after upstream 200 so clients get first
+                # SSE bytes without waiting for model tokens. Still treat empty
+                # 200 as a clean api_error (not empty stop) for compatibility.
+                success_noted = False
+                content_seen = False
+                reasoning_seen = False
+                saw_model_output = False
 
-                # message_start first — only after upstream accepted
-                for ev in assembler.start(input_tokens=prompt_est):
+                def _note_success_once() -> None:
+                    nonlocal success_noted
+                    if success_noted:
+                        return
+                    success_noted = True
+                    asyncio.create_task(
+                        asyncio.to_thread(
+                            account_pool.report_success, creds.auth_key, model=model
+                        )
+                    )
+                    if conversation_fp:
+                        if idx > 0:
+                            asyncio.create_task(
+                                asyncio.to_thread(
+                                    conversation_affinity.rebind_on_failover,
+                                    conversation_fp,
+                                    first_tried,
+                                    creds.auth_key,
+                                )
+                            )
+                        else:
+                            asyncio.create_task(
+                                asyncio.to_thread(
+                                    conversation_affinity.bind_affinity,
+                                    conversation_fp,
+                                    creds.auth_key,
+                                )
+                            )
+
+                # Open with 0 input_tokens for TTFT; finish() attaches real usage later.
+                # Avoid scanning full messages/tools before first SSE byte.
+                for ev in assembler.start(input_tokens=0):
                     yield ev
                 stream_started = True
 
@@ -4614,6 +4913,13 @@ async def _stream_anthropic_with_failover_inner(
                             usage = parsed["usage"]
                             continue
                         if content or reasoning or tool_calls:
+                            if content:
+                                content_seen = True
+                                saw_model_output = True
+                            if reasoning:
+                                reasoning_seen = True
+                            if tool_calls:
+                                saw_model_output = True
                             if timing is not None and (
                                 content or tool_calls or reasoning
                             ):
@@ -4624,6 +4930,8 @@ async def _stream_anthropic_with_failover_inner(
                                         else ("tool" if tool_calls else "reasoning")
                                     )
                                 )
+                            if content or tool_calls:
+                                _note_success_once()
                             async for ev in _yield_anthropic_events_serial(
                                 assembler.feed(
                                     content=content or None,
@@ -4638,6 +4946,39 @@ async def _stream_anthropic_with_failover_inner(
                             # arrives on a subsequent empty-choices chunk.
                             finished = True
                             held_finish = finish
+                    # Empty 200: stream already opened — emit clean error, not empty stop.
+                    if (
+                        not saw_model_output
+                        and not assembler._saw_tool
+                        and not content_seen
+                        and not reasoning_seen
+                    ):
+                        empty_err = (
+                            "Upstream returned HTTP 200 with empty model output "
+                            "(no content/tool_calls)"
+                        )
+                        await asyncio.to_thread(
+                            account_pool.report_failure,
+                            creds.auth_key,
+                            error=empty_err,
+                            status_code=502,
+                            model=model,
+                        )
+                        _record_usage_safe(
+                            ok=False,
+                            api_key_id=api_key_id,
+                            account_id=creds.auth_key,
+                            model=model,
+                            protocol="anthropic",
+                            stream=True,
+                        )
+                        last_err = empty_err
+                        if timing is not None:
+                            timing.emit(ok=False, error=empty_err)
+                        yield anth.anthropic_stream_error(
+                            empty_err, err_type="api_error"
+                        )
+                        return
                     # Drain complete: now emit terminal events with best usage
                     fr = held_finish or (
                         "tool_calls" if assembler._saw_tool else "stop"
@@ -4649,9 +4990,10 @@ async def _stream_anthropic_with_failover_inner(
                         "",
                     ):
                         fr = "tool_calls"
+                    _note_success_once()
                     async for ev in _yield_anthropic_events_serial(
                         assembler.finish(
-                            fr, usage=usage, input_tokens=prompt_est
+                            fr, usage=usage, input_tokens=_ensure_prompt_est()
                         ),
                         client_gone=client_gone,
                     ):
@@ -4665,9 +5007,9 @@ async def _stream_anthropic_with_failover_inner(
                         )
                         if usage
                         else {
-                            "prompt_tokens": prompt_est,
+                            "prompt_tokens": _ensure_prompt_est(),
                             "completion_tokens": 0,
-                            "total_tokens": prompt_est,
+                            "total_tokens": _ensure_prompt_est(),
                         },
                         ok=True,
                         api_key_id=api_key_id,
@@ -4679,25 +5021,80 @@ async def _stream_anthropic_with_failover_inner(
                     return
                 else:
                     raw = await resp.aread()
+                    if not raw or not raw.strip():
+                        empty_err = (
+                            "Upstream returned HTTP 200 with empty body "
+                            "(no model output)"
+                        )
+                        await asyncio.to_thread(
+                            account_pool.report_failure,
+                            creds.auth_key,
+                            error=empty_err,
+                            status_code=502,
+                            model=model,
+                        )
+                        _record_usage_safe(
+                            ok=False,
+                            api_key_id=api_key_id,
+                            account_id=creds.auth_key,
+                            model=model,
+                            protocol="anthropic",
+                            stream=True,
+                        )
+                        last_err = empty_err
+                        if timing is not None:
+                            timing.emit(ok=False, error=empty_err)
+                        yield anth.anthropic_stream_error(
+                            empty_err, err_type="api_error"
+                        )
+                        return
                     try:
                         data = json.loads(raw)
                     except json.JSONDecodeError:
                         text = raw.decode("utf-8", errors="replace")
+                        if not text.strip():
+                            empty_err = (
+                                "Upstream returned HTTP 200 with empty body "
+                                "(no model output)"
+                            )
+                            await asyncio.to_thread(
+                                account_pool.report_failure,
+                                creds.auth_key,
+                                error=empty_err,
+                                status_code=502,
+                                model=model,
+                            )
+                            _record_usage_safe(
+                                ok=False,
+                                api_key_id=api_key_id,
+                                account_id=creds.auth_key,
+                                model=model,
+                                protocol="anthropic",
+                                stream=True,
+                            )
+                            last_err = empty_err
+                            if timing is not None:
+                                timing.emit(ok=False, error=empty_err)
+                            yield anth.anthropic_stream_error(
+                                empty_err, err_type="api_error"
+                            )
+                            return
+                        _note_success_once()
                         async for ev in _yield_anthropic_events_serial(
                             assembler.feed(content=text)
                         ):
                             yield ev
                         async for ev in _yield_anthropic_events_serial(
                             assembler.finish(
-                                "stop", usage=usage, input_tokens=prompt_est
+                                "stop", usage=usage, input_tokens=_ensure_prompt_est()
                             )
                         ):
                             yield ev
                         _record_usage_safe(
                             usage={
-                                "prompt_tokens": prompt_est,
+                                "prompt_tokens": _ensure_prompt_est(),
                                 "completion_tokens": _estimate_text_tokens(text),
-                                "total_tokens": prompt_est
+                                "total_tokens": _ensure_prompt_est()
                                 + _estimate_text_tokens(text),
                             },
                             ok=True,
@@ -4737,6 +5134,40 @@ async def _stream_anthropic_with_failover_inner(
                             finish_reason = (
                                 ch0.get("finish_reason") or finish_reason
                             )
+                        if _is_empty_model_payload(
+                            content=content,
+                            reasoning=reasoning,
+                            tool_calls=tool_calls
+                            if isinstance(tool_calls, list)
+                            else None,
+                        ):
+                            empty_err = (
+                                "Upstream returned HTTP 200 with empty model output "
+                                "(no content/tool_calls)"
+                            )
+                            await asyncio.to_thread(
+                                account_pool.report_failure,
+                                creds.auth_key,
+                                error=empty_err,
+                                status_code=502,
+                                model=model,
+                            )
+                            _record_usage_safe(
+                                ok=False,
+                                api_key_id=api_key_id,
+                                account_id=creds.auth_key,
+                                model=model,
+                                protocol="anthropic",
+                                stream=True,
+                            )
+                            last_err = empty_err
+                            if timing is not None:
+                                timing.emit(ok=False, error=empty_err)
+                            yield anth.anthropic_stream_error(
+                                empty_err, err_type="api_error"
+                            )
+                            return
+                        _note_success_once()
                         if content or reasoning or tool_calls:
                             async for ev in _yield_anthropic_events_serial(
                                 assembler.feed(
@@ -4757,7 +5188,7 @@ async def _stream_anthropic_with_failover_inner(
                             assembler.finish(
                                 finish_reason,
                                 usage=usage,
-                                input_tokens=prompt_est,
+                                input_tokens=_ensure_prompt_est(),
                             )
                         ):
                             yield ev
@@ -4770,9 +5201,9 @@ async def _stream_anthropic_with_failover_inner(
                             )
                             if usage
                             else {
-                                "prompt_tokens": prompt_est,
+                                "prompt_tokens": _ensure_prompt_est(),
                                 "completion_tokens": 0,
-                                "total_tokens": prompt_est,
+                                "total_tokens": _ensure_prompt_est(),
                             },
                             ok=True,
                             api_key_id=api_key_id,
@@ -4784,11 +5215,12 @@ async def _stream_anthropic_with_failover_inner(
                         return
 
             if not finished:
+                _note_success_once()
                 async for ev in _yield_anthropic_events_serial(
                     assembler.finish(
                         "tool_calls" if assembler._saw_tool else "stop",
                         usage=usage,
-                        input_tokens=prompt_est,
+                        input_tokens=_ensure_prompt_est(),
                     )
                 ):
                     yield ev
@@ -4801,9 +5233,9 @@ async def _stream_anthropic_with_failover_inner(
                 )
                 if usage
                 else {
-                    "prompt_tokens": prompt_est,
+                    "prompt_tokens": _ensure_prompt_est(),
                     "completion_tokens": 0,
-                    "total_tokens": prompt_est,
+                    "total_tokens": _ensure_prompt_est(),
                 },
                 ok=True,
                 api_key_id=api_key_id,
@@ -4814,6 +5246,14 @@ async def _stream_anthropic_with_failover_inner(
             )
             return
         except asyncio.CancelledError:
+            # Prefer a clean Anthropic error/stop over a hard cut when stream open.
+            if stream_started:
+                try:
+                    yield anth.anthropic_stream_error(
+                        "stream cancelled", err_type="api_error"
+                    )
+                except Exception:
+                    pass
             return
         except Exception as e:  # noqa: BLE001
             account_pool.report_failure(

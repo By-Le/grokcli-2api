@@ -1383,17 +1383,22 @@ def apply_runtime_settings_to_modules() -> None:
 _REG_CONFIG_KEYS = (
     "mail_provider",
     "base_url",
+    # Per-provider base URLs for self-hosted services (do not share one field).
+    "moemail_base_url",
+    "cfmail_base_url",
     # Active key (derived from selected provider). Kept for adapter/env compat.
     "api_key",
     # Per-provider secrets — all persist in DB so switching provider keeps keys.
     "moemail_api_key",
     "yyds_api_key",
     "gptmail_api_key",
+    "cfmail_api_key",
     # Active domain + per-provider domains (same pattern as keys).
     "domain",
     "moemail_domain",
     "yyds_domain",
     "gptmail_domain",
+    "cfmail_domain",
     "prefix",
     "expiry_ms",
     "captcha_provider",
@@ -1414,6 +1419,7 @@ _REG_SECRET_KEYS = frozenset(
         "moemail_api_key",
         "yyds_api_key",
         "gptmail_api_key",
+        "cfmail_api_key",
         "yescaptcha_key",
         "proxy_password",
     }
@@ -1423,12 +1429,21 @@ _MAIL_PROVIDER_KEY_FIELDS = {
     "moemail": "moemail_api_key",
     "yyds": "yyds_api_key",
     "gptmail": "gptmail_api_key",
+    "cfmail": "cfmail_api_key",
 }
 
 _MAIL_PROVIDER_DOMAIN_FIELDS = {
     "moemail": "moemail_domain",
     "yyds": "yyds_domain",
     "gptmail": "gptmail_domain",
+    "cfmail": "cfmail_domain",
+}
+
+# Self-hosted providers keep independent base URLs so switching never overwrites
+# another provider's host (MoeMail vs Cloudflare Temp Email).
+_MAIL_PROVIDER_BASE_URL_FIELDS = {
+    "moemail": "moemail_base_url",
+    "cfmail": "cfmail_base_url",
 }
 
 
@@ -1456,9 +1471,11 @@ def _env_registration_defaults() -> dict[str, Any]:
         )
 
         if MOEMAIL_BASE_URL:
+            # Env base URL only seeds MoeMail — never bleed into CF Temp Email.
+            out["moemail_base_url"] = str(MOEMAIL_BASE_URL)
             out["base_url"] = str(MOEMAIL_BASE_URL)
         if MOEMAIL_DOMAIN:
-            # Env domain only seeds MoeMail — never bleed into YYDS/GPTMail.
+            # Env domain only seeds MoeMail — never bleed into YYDS/GPTMail/CF.
             out["moemail_domain"] = str(MOEMAIL_DOMAIN)
         if MOEMAIL_EXPIRY_MS is not None:
             out["expiry_ms"] = int(MOEMAIL_EXPIRY_MS)
@@ -1481,6 +1498,14 @@ def _env_registration_defaults() -> dict[str, Any]:
         ).strip()
         if gpt_key:
             out["gptmail_api_key"] = gpt_key
+        cf_key = (
+            os.environ.get("GROK2API_CFMAIL_API_KEY")
+            or os.environ.get("CFMAIL_API_KEY")
+            or os.environ.get("GROK2API_CF_TEMP_EMAIL_ADMIN")
+            or ""
+        ).strip()
+        if cf_key:
+            out["cfmail_api_key"] = cf_key
         yyds_dom = (
             os.environ.get("GROK2API_YYDS_DOMAIN")
             or os.environ.get("YYDS_DOMAIN")
@@ -1495,6 +1520,21 @@ def _env_registration_defaults() -> dict[str, Any]:
         ).strip().lstrip("@").strip(".")
         if gpt_dom:
             out["gptmail_domain"] = gpt_dom
+        cf_dom = (
+            os.environ.get("GROK2API_CFMAIL_DOMAIN")
+            or os.environ.get("CFMAIL_DOMAIN")
+            or ""
+        ).strip().lstrip("@").strip(".")
+        if cf_dom:
+            out["cfmail_domain"] = cf_dom
+        cf_base = (
+            os.environ.get("GROK2API_CFMAIL_BASE_URL")
+            or os.environ.get("CFMAIL_BASE_URL")
+            or ""
+        ).strip()
+        if cf_base:
+            # Dedicated CF host only — never overwrite MoeMail base_url.
+            out["cfmail_base_url"] = cf_base
         if XAI_PROXY:
             out["proxy"] = str(XAI_PROXY)
         if XAI_PROXY_USERNAME:
@@ -1572,11 +1612,14 @@ def _normalize_registration_config(
             return str(src.get(key) or "").strip().lstrip("@").strip(".")[:128]
         return str(env.get(key, "") or "").strip().lstrip("@").strip(".")[:128]
 
-    cfg["base_url"] = _pick_str("base_url", 256)
+    legacy_base_url = _pick_str("base_url", 256)
+    cfg["moemail_base_url"] = _pick_str("moemail_base_url", 256)
+    cfg["cfmail_base_url"] = _pick_str("cfmail_base_url", 256)
     legacy_api_key = _pick_str("api_key", 512)
     cfg["moemail_api_key"] = _pick_str("moemail_api_key", 512)
     cfg["yyds_api_key"] = _pick_str("yyds_api_key", 512)
     cfg["gptmail_api_key"] = _pick_str("gptmail_api_key", 512)
+    cfg["cfmail_api_key"] = _pick_str("cfmail_api_key", 512)
     # Do NOT env-fill legacy domain into every provider — only use explicit src.
     if "domain" in src:
         legacy_domain = str(src.get("domain") or "").strip().lstrip("@").strip(".")[:128]
@@ -1585,9 +1628,11 @@ def _normalize_registration_config(
     cfg["moemail_domain"] = _pick_domain("moemail_domain")
     cfg["yyds_domain"] = _pick_domain("yyds_domain")
     cfg["gptmail_domain"] = _pick_domain("gptmail_domain")
+    cfg["cfmail_domain"] = _pick_domain("cfmail_domain")
     cfg["prefix"] = _pick_str("prefix", 64)
     try:
         from moemail import (
+            normalize_cfmail_base_url,
             normalize_gptmail_base_url,
             normalize_mail_provider,
             normalize_yyds_base_url,
@@ -1596,20 +1641,30 @@ def _normalize_registration_config(
         normalize_mail_provider = None  # type: ignore[assignment]
         normalize_yyds_base_url = None  # type: ignore[assignment]
         normalize_gptmail_base_url = None  # type: ignore[assignment]
+        normalize_cfmail_base_url = None  # type: ignore[assignment]
 
     mail_raw = _pick_str("mail_provider", 32).lower()
+    # Prefer explicit mail_provider; only use base_url as a hint when empty.
     if normalize_mail_provider is not None:
         cfg["mail_provider"] = normalize_mail_provider(
-            mail_raw or None, base_url=cfg["base_url"]
+            mail_raw or None,
+            base_url=legacy_base_url
+            or cfg.get("cfmail_base_url")
+            or cfg.get("moemail_base_url")
+            or None,
         )
     else:
         if mail_raw in {"yyds", "yydsmail"}:
             cfg["mail_provider"] = "yyds"
         elif mail_raw in {"gptmail", "gpt-mail", "chatgptmail"}:
             cfg["mail_provider"] = "gptmail"
+        elif mail_raw in {"cfmail", "cloudflare", "cloudflare_temp_email", "awsl"}:
+            cfg["mail_provider"] = "cfmail"
         else:
             cfg["mail_provider"] = (
-                mail_raw if mail_raw in {"moemail", "yyds", "gptmail"} else "moemail"
+                mail_raw
+                if mail_raw in {"moemail", "yyds", "gptmail", "cfmail"}
+                else "moemail"
             )
 
     # Migrate legacy single api_key into the selected provider slot when empty.
@@ -1634,6 +1689,17 @@ def _normalize_registration_config(
         if cfg["mail_provider"] == "moemail" and not cfg.get("moemail_domain"):
             cfg["moemail_domain"] = legacy_domain
 
+    # Migrate legacy single base_url into the selected self-hosted provider slot.
+    # Never copy CF host into MoeMail or vice-versa.
+    if legacy_base_url:
+        bslot = _MAIL_PROVIDER_BASE_URL_FIELDS.get(cfg["mail_provider"])
+        if bslot and not cfg.get(bslot):
+            # Only seed when the dedicated slot was absent/empty.
+            if bslot not in src or not str(src.get(bslot) or "").strip():
+                cfg[bslot] = legacy_base_url
+        if cfg["mail_provider"] == "moemail" and not cfg.get("moemail_base_url"):
+            cfg["moemail_base_url"] = legacy_base_url
+
     # Active key always mirrors the selected provider (adapter reads api_key).
     active_slot = _MAIL_PROVIDER_KEY_FIELDS.get(
         cfg["mail_provider"], "moemail_api_key"
@@ -1646,7 +1712,15 @@ def _normalize_registration_config(
     )
     cfg["domain"] = str(cfg.get(active_dom_slot) or "").strip().lstrip("@").strip(".")
 
+    # Per-provider base URL normalization. Active base_url always mirrors the
+    # selected self-hosted provider so adapter/env keep working.
+    if normalize_cfmail_base_url is not None and cfg.get("cfmail_base_url"):
+        cfg["cfmail_base_url"] = normalize_cfmail_base_url(cfg["cfmail_base_url"])
+    if cfg.get("moemail_base_url"):
+        cfg["moemail_base_url"] = str(cfg["moemail_base_url"]).strip().rstrip("/")
+
     # YYDS / GPTMail use fixed official hosts — no user URL required.
+    # CF Temp Email / MoeMail are self-hosted and keep independent slots.
     if cfg["mail_provider"] == "yyds":
         cfg["base_url"] = (
             normalize_yyds_base_url(None)
@@ -1659,9 +1733,18 @@ def _normalize_registration_config(
             if normalize_gptmail_base_url is not None
             else "https://mail.chatgpt.org.uk"
         )
+    elif cfg["mail_provider"] == "cfmail":
+        raw_base = cfg.get("cfmail_base_url") or ""
+        cfg["cfmail_base_url"] = (
+            normalize_cfmail_base_url(str(raw_base) if raw_base else None)
+            if normalize_cfmail_base_url is not None
+            else (str(raw_base).strip() or "https://temp-email-api.awsl.uk")
+        )
+        cfg["base_url"] = cfg["cfmail_base_url"]
     else:
-        # MoeMail: keep user base_url (self-hosted).
-        pass
+        # MoeMail: active base_url mirrors moemail_base_url.
+        cfg["base_url"] = str(cfg.get("moemail_base_url") or "").strip()
+        cfg["moemail_base_url"] = cfg["base_url"]
 
     provider_raw = _pick_str("captcha_provider", 32).lower()
     if provider_raw not in {"local", "yescaptcha"}:
@@ -1699,6 +1782,7 @@ def _normalize_registration_config(
         # YYDS / GPTMail temp inboxes auto-expire ~24h; permanent/3d not meaningful.
         if expiry in (0, 259200000):
             expiry = 86400000
+    # CF Temp Email addresses are durable (JWT mailbox); keep user expiry for UI only.
     cfg["expiry_ms"] = expiry
 
     def _int_field(key: str, default: int, lo: int, hi: int) -> int:
@@ -1755,12 +1839,14 @@ def get_registration_config(*, include_secrets: bool = True) -> dict[str, Any]:
     ))
     has_yyds = bool(cfg.get("yyds_api_key"))
     has_gpt = bool(cfg.get("gptmail_api_key"))
+    has_cf = bool(cfg.get("cfmail_api_key"))
     has_active = bool(cfg.get("api_key"))
     public["configured"] = {
         "moemail": has_moemail,
         "yyds": has_yyds,
         "gptmail": has_gpt,
-        "mail": has_active or has_moemail or has_yyds or has_gpt,
+        "cfmail": has_cf,
+        "mail": has_active or has_moemail or has_yyds or has_gpt or has_cf,
         "yescaptcha": bool(cfg.get("yescaptcha_key")),
         "local_solver": bool(cfg.get("local_solver_url")),
         "captcha": (
@@ -1832,6 +1918,7 @@ def set_registration_config(
         ).strip().lower() or "moemail"
     active_key_slot = _MAIL_PROVIDER_KEY_FIELDS.get(prov, "moemail_api_key")
     active_dom_slot = _MAIL_PROVIDER_DOMAIN_FIELDS.get(prov, "moemail_domain")
+    active_base_slot = _MAIL_PROVIDER_BASE_URL_FIELDS.get(prov)
 
     for key in _REG_CONFIG_KEYS:
         if key not in patch:
@@ -1872,6 +1959,16 @@ def set_registration_config(
             if key in current_stored:
                 base[key] = current_stored[key]
             continue
+        # Same for inactive self-hosted base URL slots.
+        if (
+            key in _MAIL_PROVIDER_BASE_URL_FIELDS.values()
+            and key != active_base_slot
+            and isinstance(val, str)
+            and not val.strip()
+        ):
+            if key in current_stored:
+                base[key] = current_stored[key]
+            continue
         base[key] = val
 
     # Mirror active api_key ↔ provider slot.
@@ -1906,8 +2003,40 @@ def set_registration_config(
             base.get(active_dom_slot) or base.get("domain") or ""
         ).strip().lstrip("@").strip(".")
 
+    # Mirror active base_url ↔ selected self-hosted provider slot only.
+    # Never write CF host into moemail_base_url or vice-versa.
+    if active_base_slot:
+        if "base_url" in patch:
+            active_base = str(patch.get("base_url") or "").strip().rstrip("/")
+            base["base_url"] = active_base
+            if active_base_slot not in patch or not str(
+                patch.get(active_base_slot) or ""
+            ).strip():
+                base[active_base_slot] = active_base
+            else:
+                base[active_base_slot] = str(
+                    patch.get(active_base_slot) or ""
+                ).strip().rstrip("/")
+                base["base_url"] = base[active_base_slot]
+        elif active_base_slot in patch:
+            base[active_base_slot] = str(
+                patch.get(active_base_slot) or ""
+            ).strip().rstrip("/")
+            base["base_url"] = base[active_base_slot]
+        else:
+            base["base_url"] = str(
+                base.get(active_base_slot) or base.get("base_url") or ""
+            ).strip().rstrip("/")
+            base[active_base_slot] = base["base_url"]
+    # Always keep inactive self-hosted host slots from previous DB when absent.
+    for bslot in _MAIL_PROVIDER_BASE_URL_FIELDS.values():
+        if bslot == active_base_slot:
+            continue
+        if bslot not in patch and bslot in current_stored:
+            base[bslot] = current_stored.get(bslot) or ""
+
     cfg = _normalize_registration_config(base, merge_env=False)
-    # Drop empty optional strings to keep the row small — except domains/keys:
+    # Drop empty optional strings to keep the row small — except domains/keys/urls:
     # empty is a real "cleared" value and must stay in DB so env cannot revive it.
     keep_empty = {
         "expiry_ms",
@@ -1915,10 +2044,15 @@ def set_registration_config(
         "moemail_domain",
         "yyds_domain",
         "gptmail_domain",
+        "cfmail_domain",
         "api_key",
         "moemail_api_key",
         "yyds_api_key",
         "gptmail_api_key",
+        "cfmail_api_key",
+        "base_url",
+        "moemail_base_url",
+        "cfmail_base_url",
     }
     cleaned = {
         k: v
@@ -1929,11 +2063,14 @@ def set_registration_config(
     for k in ("expiry_ms", "count", "concurrency", "stagger_ms", "probe_delay_sec"):
         cleaned[k] = cfg[k]
     # Always persist active + per-provider domain slots (including empty).
-    for k in ("domain", "moemail_domain", "yyds_domain", "gptmail_domain"):
+    for k in ("domain", "moemail_domain", "yyds_domain", "gptmail_domain", "cfmail_domain"):
         cleaned[k] = str(cfg.get(k) or "").strip().lstrip("@").strip(".")
     # Always persist active + per-provider keys (including empty after clear).
-    for k in ("api_key", "moemail_api_key", "yyds_api_key", "gptmail_api_key"):
+    for k in ("api_key", "moemail_api_key", "yyds_api_key", "gptmail_api_key", "cfmail_api_key"):
         cleaned[k] = str(cfg.get(k) or "").strip()
+    # Always persist active + per-provider base URLs (including empty after clear).
+    for k in ("base_url", "moemail_base_url", "cfmail_base_url"):
+        cleaned[k] = str(cfg.get(k) or "").strip().rstrip("/")
 
     _set_setting_value("registration_config", cleaned)
     apply_registration_config_to_runtime(cleaned)
@@ -1956,17 +2093,21 @@ def apply_registration_config_to_runtime(cfg: dict[str, Any] | None = None) -> N
             os.environ.pop(name, None)
 
     mail_provider = str(cfg.get("mail_provider") or "moemail").strip().lower()
-    if mail_provider not in {"moemail", "yyds", "gptmail"}:
+    if mail_provider not in {"moemail", "yyds", "gptmail", "cfmail"}:
         mail_provider = "moemail"
     # Prefer per-provider key; fall back to legacy api_key.
     slot = _MAIL_PROVIDER_KEY_FIELDS.get(mail_provider, "moemail_api_key")
     api_key = str(cfg.get(slot) or cfg.get("api_key") or "").strip()
+    moe_base = str(cfg.get("moemail_base_url") or "").strip().rstrip("/")
+    cf_base = str(cfg.get("cfmail_base_url") or "").strip().rstrip("/")
     if mail_provider == "yyds":
         base_url = "https://maliapi.215.im"
     elif mail_provider == "gptmail":
         base_url = "https://mail.chatgpt.org.uk"
+    elif mail_provider == "cfmail":
+        base_url = cf_base or str(cfg.get("base_url") or "").strip().rstrip("/")
     else:
-        base_url = str(cfg.get("base_url") or "").strip()
+        base_url = moe_base or str(cfg.get("base_url") or "").strip().rstrip("/")
     dslot = _MAIL_PROVIDER_DOMAIN_FIELDS.get(mail_provider, "moemail_domain")
     domain = str(cfg.get(dslot) or cfg.get("domain") or "").strip().lstrip("@").strip(".")
     provider = str(cfg.get("captcha_provider") or "local").strip().lower()
@@ -1989,14 +2130,39 @@ def apply_registration_config_to_runtime(cfg: dict[str, Any] | None = None) -> N
     mkey = str(cfg.get("moemail_api_key") or "").strip()
     ykey = str(cfg.get("yyds_api_key") or "").strip()
     gkey = str(cfg.get("gptmail_api_key") or "").strip()
+    ckey = str(cfg.get("cfmail_api_key") or "").strip()
     _set_env("GROK2API_MOEMAIL_ONLY_API_KEY", mkey)
     _set_env("GROK2API_YYDS_API_KEY", ykey)
     _set_env("YYDS_API_KEY", ykey)
     _set_env("GROK2API_GPTMAIL_API_KEY", gkey)
     _set_env("GPTMAIL_API_KEY", gkey)
+    _set_env("GROK2API_CFMAIL_API_KEY", ckey)
+    _set_env("CFMAIL_API_KEY", ckey)
+    # Keep MoeMail / CF hosts in dedicated env slots — never overwrite one with
+    # the other when switching the active provider.
+    _set_env("GROK2API_MOEMAIL_BASE_URL", moe_base if mail_provider == "moemail" else moe_base)
+    _set_env("GROK2API_CFMAIL_BASE_URL", cf_base)
+    _set_env("CFMAIL_BASE_URL", cf_base)
     if base_url:
-        _set_env("GROK2API_MOEMAIL_BASE_URL", base_url)
-    _set_env("GROK2API_MOEMAIL_DOMAIN", domain)
+        # Active adapter host (helpers still read MOEMAIL_BASE_URL historically).
+        _set_env("GROK2API_MOEMAIL_BASE_URL", base_url if mail_provider != "cfmail" else moe_base)
+        if mail_provider == "cfmail":
+            _set_env("GROK2API_CFMAIL_BASE_URL", base_url)
+            _set_env("CFMAIL_BASE_URL", base_url)
+            # Active helpers fall back to MOEMAIL_BASE_URL — mirror CF host only
+            # while CF is selected so create/fetch hit the right Workers URL.
+            _set_env("GROK2API_MOEMAIL_BASE_URL", base_url)
+            _set_env("MOEMAIL_BASE_URL", base_url)
+        elif mail_provider == "moemail":
+            _set_env("MOEMAIL_BASE_URL", base_url)
+    _set_env("GROK2API_MOEMAIL_DOMAIN", domain if mail_provider == "moemail" else str(cfg.get("moemail_domain") or "").strip())
+    if mail_provider == "cfmail":
+        _set_env("GROK2API_CFMAIL_DOMAIN", domain)
+        _set_env("CFMAIL_DOMAIN", domain)
+    else:
+        # Keep dedicated CF domain env in sync with stored slot even when inactive.
+        _set_env("GROK2API_CFMAIL_DOMAIN", str(cfg.get("cfmail_domain") or "").strip())
+        _set_env("CFMAIL_DOMAIN", str(cfg.get("cfmail_domain") or "").strip())
     try:
         probe_delay = int(cfg.get("probe_delay_sec", 30))
     except (TypeError, ValueError):

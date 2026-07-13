@@ -948,7 +948,9 @@ class ResponsesLiveStreamer:
             return cur
         return cur + inc
 
-    def _merge_tool_args(self, current: str, incoming: str) -> str:
+    def _merge_tool_args(
+        self, current: str, incoming: str, *, tool_name: str | None = None
+    ) -> str:
         """Merge streamed tool args without double-append corruption.
 
         Secondary relays often re-send cumulative JSON. Always-append would
@@ -958,7 +960,9 @@ class ResponsesLiveStreamer:
         try:
             import anthropic_compat as anth
 
-            return anth.merge_tool_argument_delta(current or "", incoming or "")
+            return anth.merge_tool_argument_delta(
+                current or "", incoming or "", tool_name=tool_name
+            )
         except Exception:
             cur = current or ""
             inc = incoming or ""
@@ -972,11 +976,15 @@ class ResponsesLiveStreamer:
                 return cur
             return cur + inc
 
-    def _args_ready(self, args: str) -> bool:
+    def _args_ready(self, args: str, *, tool_name: str | None = None) -> bool:
         try:
             import anthropic_compat as anth
 
-            return bool(anth.is_complete_tool_arguments_json(args or ""))
+            return bool(
+                anth.is_complete_tool_arguments_json(
+                    args or "", tool_name=tool_name
+                )
+            )
         except Exception:
             text = str(args or "").strip()
             if not text or text[0] not in "{[":
@@ -1020,7 +1028,8 @@ class ResponsesLiveStreamer:
                 if slot.get("call_id") or str(args).strip():
                     break
                 continue
-            if not self._args_ready(args):
+            if not self._args_ready(args, tool_name=name):
+                # Hold partial objects (e.g. Update with only file_path).
                 break
             # Open + emit full args + close in one burst (atomic for converters).
             if idx not in self._tool_opened:
@@ -1113,12 +1122,12 @@ class ResponsesLiveStreamer:
                 args_piece = fn.get("arguments")
                 if not isinstance(args_piece, str):
                     args_piece = _stringify(args_piece)
-                slot["arguments"] = self._merge_tool_args(slot.get("arguments") or "", args_piece or "")
+                slot["arguments"] = self._merge_tool_args(slot.get("arguments") or "", args_piece or "", tool_name=slot.get("name") or "")
             elif tc.get("arguments") is not None:
                 args_piece = tc.get("arguments")
                 if not isinstance(args_piece, str):
                     args_piece = _stringify(args_piece)
-                slot["arguments"] = self._merge_tool_args(slot.get("arguments") or "", args_piece or "")
+                slot["arguments"] = self._merge_tool_args(slot.get("arguments") or "", args_piece or "", tool_name=slot.get("name") or "")
         # Only emit tools whose name+complete JSON args are ready.
         frames.extend(self._emit_ready_tools())
         return frames

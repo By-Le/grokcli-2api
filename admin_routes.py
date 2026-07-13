@@ -186,13 +186,13 @@ class EmailRegistrationBody(BaseModel):
     # Backward-compat: older clients sent provider=moemail for the mail service.
     provider: str | None = Field(
         default=None,
-        pattern="^(moemail|yyds|gptmail)$",
+        pattern="^(moemail|yyds|gptmail|cfmail)$",
         description="Deprecated alias of mail_provider",
     )
     mail_provider: str | None = Field(
         default=None,
-        pattern="^(moemail|yyds|gptmail)$",
-        description="Temp-mail: moemail | yyds (vip.215.im) | gptmail (mail.chatgpt.org.uk)",
+        pattern="^(moemail|yyds|gptmail|cfmail)$",
+        description="Temp-mail: moemail | yyds | gptmail | cfmail (cloudflare_temp_email)",
     )
     protocol: str = Field(default="grpc", pattern="^grpc$")
     email: str | None = Field(default=None, max_length=256)
@@ -209,9 +209,11 @@ class EmailRegistrationBody(BaseModel):
     moemail_api_key: str | None = Field(default=None, max_length=512)
     yyds_api_key: str | None = Field(default=None, max_length=512)
     gptmail_api_key: str | None = Field(default=None, max_length=512)
+    cfmail_api_key: str | None = Field(default=None, max_length=512)
     moemail_domain: str | None = Field(default=None, max_length=128)
     yyds_domain: str | None = Field(default=None, max_length=128)
     gptmail_domain: str | None = Field(default=None, max_length=128)
+    cfmail_domain: str | None = Field(default=None, max_length=128)
     captcha_provider: str | None = Field(
         default=None,
         pattern="^(local|yescaptcha)$",
@@ -268,8 +270,8 @@ class RegistrationConfigBody(BaseModel):
 
     mail_provider: str | None = Field(
         default=None,
-        pattern="^(moemail|yyds|gptmail)$",
-        description="Temp-mail: moemail | yyds (vip.215.im) | gptmail (mail.chatgpt.org.uk)",
+        pattern="^(moemail|yyds|gptmail|cfmail)$",
+        description="Temp-mail: moemail | yyds | gptmail | cfmail (cloudflare_temp_email)",
     )
     base_url: str | None = Field(
         default=None,
@@ -1686,14 +1688,18 @@ def _registration_cfg_from_body(body: EmailRegistrationBody | RegistrationConfig
     return {
         "mail_provider": mail_provider,
         "base_url": body.base_url,
+        "moemail_base_url": getattr(body, "moemail_base_url", None),
+        "cfmail_base_url": getattr(body, "cfmail_base_url", None),
         "api_key": getattr(body, "api_key", None),
         "moemail_api_key": getattr(body, "moemail_api_key", None),
         "yyds_api_key": getattr(body, "yyds_api_key", None),
         "gptmail_api_key": getattr(body, "gptmail_api_key", None),
+        "cfmail_api_key": getattr(body, "cfmail_api_key", None),
         "domain": getattr(body, "domain", None),
         "moemail_domain": getattr(body, "moemail_domain", None),
         "yyds_domain": getattr(body, "yyds_domain", None),
         "gptmail_domain": getattr(body, "gptmail_domain", None),
+        "cfmail_domain": getattr(body, "cfmail_domain", None),
         "prefix": getattr(body, "prefix", None),
         "expiry_ms": getattr(body, "expiry_ms", None),
         "captcha_provider": getattr(body, "captcha_provider", None),

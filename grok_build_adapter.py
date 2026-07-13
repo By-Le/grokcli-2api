@@ -483,9 +483,9 @@ def _make_email_receiver(
         )
     base = (base_url or MOEMAIL_BASE_URL).rstrip("/")
     prov = normalize_mail_provider(mail_provider, base_url=base)
-    # YYDS/GPTMail: empty domain means provider-side auto/random pick.
+    # YYDS/GPTMail/CFMail: empty domain means provider-side auto/random pick.
     # Never bleed MoeMail's MOEMAIL_DOMAIN (default example.com) into them.
-    if prov in {"yyds", "gptmail"}:
+    if prov in {"yyds", "gptmail", "cfmail"}:
         dom = (domain or "").strip().lstrip("@").strip(".")
     else:
         dom = (domain or MOEMAIL_DOMAIN or "").strip().lstrip("@").strip(".")
@@ -523,6 +523,8 @@ def _make_email_receiver(
                 default_base = "https://maliapi.215.im"
             elif provider == "gptmail":
                 default_base = "https://mail.chatgpt.org.uk"
+            elif provider == "cfmail":
+                default_base = "https://temp-email-api.awsl.uk"
             else:
                 default_base = "https://moemail.521884.xyz"
             self.base_url = base_url or default_base

@@ -115,7 +115,7 @@ AFFINITY_MAX = int(os.getenv("GROK2API_AFFINITY_MAX", "5000"))
 # Background token maintenance interval (seconds) for multi-account on Linux.
 # Large pools refresh in small batches, so a shorter base interval still keeps
 # access tokens warm without one huge fan-out.
-TOKEN_MAINTAIN_INTERVAL = float(os.getenv("GROK2API_TOKEN_MAINTAIN_INTERVAL", "180"))
+TOKEN_MAINTAIN_INTERVAL = float(os.getenv("GROK2API_TOKEN_MAINTAIN_INTERVAL", "90"))
 
 # Background model health probe interval (seconds). 0 = only on demand / on error
 MODEL_HEALTH_INTERVAL = float(os.getenv("GROK2API_MODEL_HEALTH_INTERVAL", "900"))
@@ -232,12 +232,15 @@ FORCE_UPSTREAM_STREAM = os.getenv("GROK2API_FORCE_STREAM", "1") not in (
 # When no keys at all, open access (dev mode) unless REQUIRE_API_KEY=1
 REQUIRE_API_KEY = os.getenv("GROK2API_REQUIRE_API_KEY", "auto")
 
-# Request timeout (seconds) for non-stream collection
-TIMEOUT = float(os.getenv("GROK2API_TIMEOUT", "600"))
+# Request timeout (seconds) for non-stream collection / overall upstream call.
+# Stream reads use a separate read timeout (see HTTP_READ_TIMEOUT) so a silent
+# thinking gap does not burn the whole request budget.
+TIMEOUT = float(os.getenv("GROK2API_TIMEOUT", "900"))
 
-# SSE idle keepalive interval for secondary relays (new-api / nginx).
-# Emit `: keepalive` comments when upstream is silent (thinking gaps).
-SSE_KEEPALIVE_INTERVAL = float(os.getenv("GROK2API_SSE_KEEPALIVE", "8"))
+# SSE idle keepalive interval for secondary relays (sub2api / new-api / nginx).
+# Emit `: keepalive` / Anthropic ping when upstream is silent (thinking gaps).
+# Default 4s — sub2api and some frontends idle-close around 10–15s.
+SSE_KEEPALIVE_INTERVAL = float(os.getenv("GROK2API_SSE_KEEPALIVE", "4"))
 
 # Compatibility for relays/UIs that only render delta.content (not reasoning_content).
 # Default off: keep reasoning in reasoning_content so OpenAI→Claude relays (sub2api)

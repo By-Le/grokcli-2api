@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import re
 import uuid
 from typing import Any
 
@@ -585,7 +586,50 @@ def is_complete_json_text(s: str) -> bool:
         return False
 
 
-def is_complete_tool_arguments_json(s: str) -> bool:
+# Claude Code / common agent tools: require these keys before first emission.
+# Grok/relays often stream a *syntactically complete* partial object first
+# (e.g. Update with only {"file_path":"..."}), then rewrite with the rest.
+# Emitting early freezes naive-append clients and makes Update/Edit fail.
+_TOOL_REQUIRED_KEYS: dict[str, tuple[str, ...]] = {
+    # Claude Code filesystem tools
+    "read": ("file_path",),
+    "write": ("file_path", "content"),
+    "edit": ("file_path", "old_string", "new_string"),
+    "update": ("file_path", "old_string", "new_string"),
+    "multiedit": ("file_path", "edits"),
+    "notebookedit": ("notebook_path", "new_source"),
+    # Shell / search
+    "bash": ("command",),
+    "shell": ("command",),
+    "grep": ("pattern",),
+    "glob": ("pattern",),
+    # Web
+    "webfetch": ("url",),
+    "websearch": ("query",),
+    "web_search": ("query",),
+}
+
+
+def _tool_name_key(name: str | None) -> str:
+    return re.sub(r"[^a-z0-9_]+", "", (name or "").strip().lower())
+
+
+def _required_keys_for_tool(name: str | None) -> tuple[str, ...]:
+    key = _tool_name_key(name)
+    if not key:
+        return ()
+    if key in _TOOL_REQUIRED_KEYS:
+        return _TOOL_REQUIRED_KEYS[key]
+    # Suffix match: mcp__x__Read / company_Update → read / update
+    for short, req in _TOOL_REQUIRED_KEYS.items():
+        if key.endswith(short) or key.endswith(f"_{short}"):
+            return req
+    return ()
+
+
+def is_complete_tool_arguments_json(
+    s: str, *, tool_name: str | None = None
+) -> bool:
     """True when s is complete tool `function.arguments` for streaming gates.
 
     OpenAI true-delta streams often emit intermediate JSON *scalars* such as
@@ -598,6 +642,10 @@ def is_complete_tool_arguments_json(s: str) -> bool:
     relays sometimes preview an empty object before the real arguments rewrite.
     Emitting `{}` first freezes naive-append clients and can leave Claude Code
     with empty tool input. Empty placeholders only flush on finish/close.
+
+    When ``tool_name`` is known (Update/Edit/Read/…), also require the tool's
+    mandatory keys so a partial object like ``{"file_path":"..."}`` is NOT
+    treated as ready before old_string/new_string arrive.
     """
     if not s or not str(s).strip():
         return False
@@ -613,6 +661,20 @@ def is_complete_tool_arguments_json(s: str) -> bool:
     # Hold empty containers until terminal flush — they are not real payloads.
     if parsed == {} or parsed == []:
         return False
+    if isinstance(parsed, dict):
+        required = _required_keys_for_tool(tool_name)
+        if required:
+            for k in required:
+                if k not in parsed:
+                    return False
+                val = parsed.get(k)
+                # Empty string for path/content fields is not a usable payload.
+                if isinstance(val, str) and not val.strip():
+                    return False
+                if val is None:
+                    return False
+                if isinstance(val, (list, dict)) and not val:
+                    return False
     return True
 
 
@@ -1012,7 +1074,12 @@ def anthropic_stream_ping() -> str:
 
 
 
-def merge_tool_argument_delta(current: str, incoming: str) -> str:
+def merge_tool_argument_delta(
+    current: str,
+    incoming: str,
+    *,
+    tool_name: str | None = None,
+) -> str:
     """
     Merge tool argument stream pieces (delta or cumulative re-send).
 
@@ -1022,6 +1089,10 @@ def merge_tool_argument_delta(current: str, incoming: str) -> str:
     Incomplete buffer + later complete non-prefix rewrite is common
     (`{"file_path":` then `{"file_path" : "/x"}`). Prefer the complete value
     instead of concatenating into invalid JSON.
+
+    For object rewrites with different key sets (Update: first only file_path,
+    later file_path+old_string+new_string), prefer the richer later object and
+    deep-merge dict keys so partial previews don't win forever.
     """
     cur = sanitize_tool_arguments_json(current) if current else ""
     piece = sanitize_tool_arguments_json(incoming) if incoming else ""
@@ -1038,8 +1109,8 @@ def merge_tool_argument_delta(current: str, incoming: str) -> str:
 
     # Prefer object/array completeness for tool args. Intermediate scalars such
     # as `"file_path"` are complete JSON but not complete tool arguments.
-    cur_complete = is_complete_tool_arguments_json(cur)
-    piece_complete = is_complete_tool_arguments_json(piece)
+    cur_complete = is_complete_tool_arguments_json(cur, tool_name=tool_name)
+    piece_complete = is_complete_tool_arguments_json(piece, tool_name=tool_name)
     cur_any = is_complete_json_text(cur)
     piece_any = is_complete_json_text(piece)
 
@@ -1060,12 +1131,36 @@ def merge_tool_argument_delta(current: str, incoming: str) -> str:
         b = json.loads(piece)
         if a == b:
             return cur
-        if isinstance(a, (dict, list)) and isinstance(b, (dict, list)):
-            # Prefer later complete object (field growth / correction).
-            return piece
-        if isinstance(a, (dict, list)):
+        if isinstance(a, dict) and isinstance(b, dict):
+            # Field growth / partial rewrite: merge keys, prefer later non-empty.
+            # Example: {"file_path":"x"} + {"file_path":"x","old_string":"a",...}
+            merged = dict(a)
+            for k, v in b.items():
+                if k not in merged:
+                    merged[k] = v
+                    continue
+                old = merged.get(k)
+                if old in (None, "", [], {}):
+                    merged[k] = v
+                elif isinstance(old, dict) and isinstance(v, dict):
+                    tmp = dict(old)
+                    tmp.update(v)
+                    merged[k] = tmp
+                elif isinstance(old, list) and isinstance(v, list) and len(v) >= len(old):
+                    merged[k] = v
+                else:
+                    # Prefer later value when both set (correction / expansion).
+                    merged[k] = v
+            try:
+                return json.dumps(merged, ensure_ascii=False, separators=(",", ":"))
+            except (TypeError, ValueError):
+                return piece if len(b) >= len(a) else cur
+        if isinstance(a, list) and isinstance(b, list):
+            # Prefer later / longer list.
+            return piece if len(b) >= len(a) else cur
+        if isinstance(a, (dict, list)) and not isinstance(b, (dict, list)):
             return cur
-        if isinstance(b, (dict, list)):
+        if isinstance(b, (dict, list)) and not isinstance(a, (dict, list)):
             return piece
     except (TypeError, ValueError, json.JSONDecodeError):
         pass
@@ -1182,7 +1277,12 @@ class AnthropicStreamAssembler:
         if not remaining:
             return events
         # Prefer holding incomplete live fragments; only force-send when closing.
-        if not is_complete_tool_arguments_json(args) and not state.get("_closing"):
+        if (
+            not is_complete_tool_arguments_json(
+                args, tool_name=state.get("name") or ""
+            )
+            and not state.get("_closing")
+        ):
             return events
         events.append(
             anthropic_stream_input_json_delta(state["block_index"], remaining)
@@ -1357,7 +1457,9 @@ class AnthropicStreamAssembler:
                 if args_piece:
                     # Merge delta OR full re-send (double-proxy safe)
                     state["args"] = merge_tool_argument_delta(
-                        state.get("args") or "", args_piece
+                        state.get("args") or "",
+                        args_piece,
+                        tool_name=state.get("name") or "",
                     )
 
             # Start / flush in ascending OpenAI tool index order. If a lower *known*
@@ -1377,7 +1479,9 @@ class AnthropicStreamAssembler:
                 ready = bool(
                     state.get("name")
                     and args_now
-                    and is_complete_tool_arguments_json(args_now)
+                    and is_complete_tool_arguments_json(
+                        args_now, tool_name=state.get("name") or ""
+                    )
                 )
                 # Open tool_use only when name is known AND args are complete JSON
                 # (or finish() will open). Avoids empty tool blocks that secondary
@@ -1450,7 +1554,9 @@ class AnthropicStreamAssembler:
                         sent
                         and args_now
                         and sent == args_now
-                        and is_complete_tool_arguments_json(args_now)
+                        and is_complete_tool_arguments_json(
+                            args_now, tool_name=state.get("name") or ""
+                        )
                     ):
                         events.append(
                             anthropic_stream_block_stop(state["block_index"])
@@ -1478,7 +1584,9 @@ class AnthropicStreamAssembler:
         has_ready_tool = any(
             (s.get("name") or "").strip()
             and (s.get("args") or "").strip()
-            and is_complete_tool_arguments_json(s.get("args") or "")
+            and is_complete_tool_arguments_json(
+                s.get("args") or "", tool_name=s.get("name") or ""
+            )
             and not s.get("stopped")
             for s in self._tools.values()
         )
@@ -1521,7 +1629,11 @@ class AnthropicStreamAssembler:
                     self._held_pre_tool
                     and not self._saw_tool
                     and not (
-                        name and args and is_complete_tool_arguments_json(args)
+                        name
+                        and args
+                        and is_complete_tool_arguments_json(
+                            args, tool_name=name
+                        )
                     )
                 ):
                     continue

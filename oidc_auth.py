@@ -316,22 +316,205 @@ class RefreshRevokedError(ValueError):
     """Refresh token permanently rejected by the IdP (invalid_grant / revoked)."""
 
 
+def _hard_delete_invalid_refresh_enabled() -> bool:
+    """Whether permanent RT failures may hard-delete accounts.
+
+    Default OFF: soft-disable (keep credentials, remove from rotation) so a
+    misclassified transient error cannot wipe usable accounts.
+    Opt-in hard delete: GROK2API_DELETE_INVALID_REFRESH=1
+    """
+    raw = (
+        os.environ.get("GROK2API_DELETE_INVALID_REFRESH")
+        or os.environ.get("DELETE_INVALID_REFRESH")
+        or "0"
+    ).strip().lower()
+    return raw in {"1", "true", "yes", "on"}
+
+
 def _is_permanent_refresh_failure(status_code: int, body: str) -> bool:
+    """Return True only for clearly permanent refresh-token rejections.
+
+    Intentionally narrow: bare ``revoked`` / ``invalid_token`` / ``token is
+    invalid`` used to match transient proxy / upstream noise and caused usable
+    accounts to be purged. Prefer soft-disable even when True.
+    """
     text = (body or "").lower()
     if status_code not in (400, 401):
         return False
-    return any(
-        marker in text
-        for marker in (
-            "invalid_grant",
-            "refresh token has been revoked",
-            "token has been revoked",
-            "revoked",
-            "invalid_token",
-            "refresh token is invalid",
-            "token is invalid",
-        )
+    # Exact-ish OIDC permanent grant failures only.
+    markers = (
+        "invalid_grant",
+        "refresh token has been revoked",
+        "refresh_token has been revoked",
+        "refresh token is invalid",
+        "refresh_token is invalid",
+        "refresh token revoked",
+        "refresh_token revoked",
+        "refresh token expired",
+        "refresh_token expired",
+        "token has been revoked",
     )
+    return any(marker in text for marker in markers)
+
+
+def mark_refresh_invalid(
+    account_id: str,
+    *,
+    reason: str = "refresh_token permanently invalid",
+    hard_delete: bool | None = None,
+) -> dict[str, Any]:
+    """Mark one account's refresh token invalid and take it out of rotation.
+
+    Default: soft action only
+      - set ``refresh_invalid`` / reason on the durable account entry
+      - disable pool rotation (enabled=False)
+      - do NOT delete credentials
+
+    Hard delete only when ``hard_delete=True`` or env
+    ``GROK2API_DELETE_INVALID_REFRESH=1``.
+    """
+    aid = str(account_id or "").strip()
+    if not aid:
+        return {"ok": False, "deleted": False, "disabled": False, "error": "missing account id"}
+    reason_s = str(reason or "refresh_token permanently invalid")[:300]
+    do_hard = _hard_delete_invalid_refresh_enabled() if hard_delete is None else bool(hard_delete)
+
+    if do_hard:
+        try:
+            from accounts import remove_account
+
+            removed = bool(remove_account(aid))
+        except Exception as e:  # noqa: BLE001
+            try:
+                def _apply(m: dict[str, Any]) -> None:
+                    if aid in m:
+                        m.pop(aid, None)
+                        return
+                    for k, v in list(m.items()):
+                        if k == aid or k.endswith(f"::{aid}"):
+                            m.pop(k, None)
+                            continue
+                        if isinstance(v, dict) and (
+                            v.get("user_id") == aid or v.get("principal_id") == aid
+                        ):
+                            m.pop(k, None)
+
+                mutate_auth_map(_apply)
+                removed = True
+            except Exception as e2:  # noqa: BLE001
+                return {
+                    "ok": False,
+                    "deleted": False,
+                    "disabled": False,
+                    "id": aid,
+                    "error": f"delete failed: {e}; fallback: {e2}"[:300],
+                }
+        try:
+            from settings_store import get_account_pool_state, save_account_pool_state
+
+            state = get_account_pool_state()
+            if aid in state:
+                state.pop(aid, None)
+                save_account_pool_state(state)
+        except Exception:
+            pass
+        try:
+            from store.pool_redis import clear_cooldown
+
+            clear_cooldown(aid)
+        except Exception:
+            pass
+        if removed:
+            print(
+                f"  [token-refresh] HARD-deleted account={aid[:64]} reason={reason_s[:120]}",
+                flush=True,
+            )
+        return {
+            "ok": True,
+            "deleted": bool(removed),
+            "disabled": False,
+            "id": aid,
+            "reason": reason_s,
+            "action": "deleted",
+        }
+
+    # Soft path: keep credentials; mark invalid + remove from rotation.
+    marked = False
+    resolved_id = aid
+    try:
+        def _mark(m: dict[str, Any]) -> None:
+            nonlocal marked, resolved_id
+            target_key = aid if isinstance(m.get(aid), dict) else None
+            if target_key is None:
+                for k, v in list(m.items()):
+                    if not isinstance(v, dict):
+                        continue
+                    if k == aid or k.endswith(f"::{aid}"):
+                        target_key = k
+                        break
+                    if v.get("user_id") == aid or v.get("principal_id") == aid:
+                        target_key = k
+                        break
+            if not target_key or not isinstance(m.get(target_key), dict):
+                return
+            ent = dict(m[target_key])
+            ent["refresh_invalid"] = True
+            ent["refresh_invalid_at"] = time.time()
+            ent["refresh_invalid_reason"] = reason_s
+            m[target_key] = ent
+            resolved_id = target_key
+            marked = True
+
+        mutate_auth_map(_mark)
+    except Exception as e:  # noqa: BLE001
+        return {
+            "ok": False,
+            "deleted": False,
+            "disabled": False,
+            "id": aid,
+            "error": f"mark failed: {e}"[:300],
+        }
+
+    disabled = False
+    try:
+        from account_pool import kick_from_pool
+
+        kick_from_pool(
+            resolved_id,
+            reason=f"refresh_invalid: {reason_s}"[:300],
+            cooldown_sec=None,
+        )
+        disabled = True
+    except Exception:
+        try:
+            from settings_store import patch_account_pool_meta
+
+            patch_account_pool_meta(
+                resolved_id,
+                {
+                    "enabled": False,
+                    "disabled_reason": f"refresh_invalid: {reason_s}"[:300],
+                    "pool_status": "disabled",
+                    "last_error": reason_s[:300],
+                },
+            )
+            disabled = True
+        except Exception:
+            pass
+
+    print(
+        f"  [token-refresh] soft-disabled account={resolved_id[:64]} reason={reason_s[:120]}",
+        flush=True,
+    )
+    return {
+        "ok": True,
+        "deleted": False,
+        "disabled": bool(disabled or marked),
+        "marked": marked,
+        "id": resolved_id,
+        "reason": reason_s,
+        "action": "disabled",
+    }
 
 
 def delete_account_for_refresh_failure(
@@ -339,74 +522,8 @@ def delete_account_for_refresh_failure(
     *,
     reason: str = "refresh_token permanently invalid",
 ) -> dict[str, Any]:
-    """Immediately remove one permanently-invalid RT account from durable store.
-
-    Used by request-path refresh failures so dead accounts do not linger until
-    the next background maintainer cycle.
-    """
-    aid = str(account_id or "").strip()
-    if not aid:
-        return {"ok": False, "deleted": False, "error": "missing account id"}
-    reason_s = str(reason or "refresh_token permanently invalid")[:300]
-    try:
-        from accounts import remove_account
-
-        removed = bool(remove_account(aid))
-    except Exception as e:  # noqa: BLE001
-        # Fallback: direct map rewrite if accounts helper is unavailable.
-        try:
-            def _apply(m: dict[str, Any]) -> None:
-                if aid in m:
-                    m.pop(aid, None)
-                    return
-                # best-effort suffix / user_id match
-                for k, v in list(m.items()):
-                    if k == aid or k.endswith(f"::{aid}"):
-                        m.pop(k, None)
-                        continue
-                    if isinstance(v, dict) and (
-                        v.get("user_id") == aid or v.get("principal_id") == aid
-                    ):
-                        m.pop(k, None)
-
-            mutate_auth_map(_apply)
-            removed = True
-        except Exception as e2:  # noqa: BLE001
-            return {
-                "ok": False,
-                "deleted": False,
-                "id": aid,
-                "error": f"delete failed: {e}; fallback: {e2}"[:300],
-            }
-
-    # Pool / redis cleanup (accounts.remove_account already does this; keep
-    # best-effort extra pass for the fallback path).
-    try:
-        from settings_store import get_account_pool_state, save_account_pool_state
-
-        state = get_account_pool_state()
-        if aid in state:
-            state.pop(aid, None)
-            save_account_pool_state(state)
-    except Exception:
-        pass
-    try:
-        from store.pool_redis import clear_cooldown
-
-        clear_cooldown(aid)
-    except Exception:
-        pass
-    if removed:
-        print(
-            f"  [token-refresh] deleted account={aid[:64]} reason={reason_s[:120]}",
-            flush=True,
-        )
-    return {
-        "ok": True,
-        "deleted": bool(removed),
-        "id": aid,
-        "reason": reason_s,
-    }
+    """Back-compat wrapper: soft-disable by default (see mark_refresh_invalid)."""
+    return mark_refresh_invalid(account_id, reason=reason)
 
 
 def refresh_access_token(
@@ -536,7 +653,8 @@ def ensure_fresh_entry(
         result = refresh_and_persist(account_id, entry)
         return result["entry"]
     except RefreshRevokedError as e:
-        delete_account_for_refresh_failure(account_id, reason=str(e))
+        # Soft-disable by default; never hard-delete on request path unless opted in.
+        mark_refresh_invalid(account_id, reason=str(e))
         raise
     except Exception:
         if raise_on_error or already_expired:
@@ -1151,10 +1269,12 @@ def refresh_all_accounts(
             reason = str(e)[:300]
             with updates_lock:
                 invalid_marks[aid] = reason
-            # Also drop immediately via shared helper so pool/redis cleanup is
-            # consistent even if the later batch map rewrite is interrupted.
+            # Soft-disable immediately so dead RTs leave rotation; hard delete
+            # only when GROK2API_DELETE_INVALID_REFRESH=1.
+            action = "disabled"
             try:
-                delete_account_for_refresh_failure(aid, reason=reason)
+                res = mark_refresh_invalid(aid, reason=reason)
+                action = str((res or {}).get("action") or "disabled")
             except Exception:
                 pass
             return {
@@ -1163,7 +1283,9 @@ def refresh_all_accounts(
                 "error": reason,
                 "permanent": True,
                 "reason": "refresh_invalid",
-                "deleted": True,
+                "deleted": action == "deleted",
+                "disabled": action != "deleted",
+                "action": action,
             }
         except Exception as e:  # noqa: BLE001
             return {"id": aid, "ok": False, "error": str(e)[:300]}
@@ -1190,24 +1312,39 @@ def refresh_all_accounts(
                         pass
                 _clients.clear()
 
-    # Permanent refresh failures: delete the account entirely (auth store + pool).
-    # Temporary failures only keep the account; successful refreshes update tokens.
+    # Permanent refresh failures: default soft-disable (mark invalid + leave pool).
+    # Hard-delete only when GROK2API_DELETE_INVALID_REFRESH=1 (handled inside
+    # mark_refresh_invalid already). Temporary failures keep the account.
+    disabled_ids: list[str] = []
     deleted_ids: list[str] = []
     deleted_reasons: dict[str, str] = {}
     if invalid_marks:
+        hard = _hard_delete_invalid_refresh_enabled()
         for aid, reason in invalid_marks.items():
-            deleted_ids.append(aid)
             deleted_reasons[aid] = reason
-            # Rewrite result rows so admin UI shows deletion, not "marked invalid".
+            if hard:
+                deleted_ids.append(aid)
+            else:
+                disabled_ids.append(aid)
             for r in results:
                 if r.get("id") == aid and (
                     r.get("permanent") or r.get("reason") == "refresh_invalid"
                 ):
-                    r["deleted"] = True
-                    r["reason"] = "refresh_invalid_deleted"
-                    r["error"] = (reason or r.get("error") or "refresh_token permanently invalid")[:300]
+                    if hard:
+                        r["deleted"] = True
+                        r["disabled"] = False
+                        r["reason"] = "refresh_invalid_deleted"
+                        r["action"] = "deleted"
+                    else:
+                        r["deleted"] = False
+                        r["disabled"] = True
+                        r["reason"] = "refresh_invalid_disabled"
+                        r["action"] = "disabled"
+                    r["error"] = (
+                        reason or r.get("error") or "refresh_token permanently invalid"
+                    )[:300]
 
-    # Single batched write for successful refreshes + permanent deletions.
+    # Single batched write for successful refreshes (+ optional hard deletes).
     if updates or deleted_ids:
         delete_set = set(deleted_ids)
 
@@ -1217,9 +1354,9 @@ def refresh_all_accounts(
                     continue
                 if aid in delete_set:
                     continue
-                # remove any other keys with same user_id / token to avoid dupes
+                # Dedupe only exact same storage user_id (never by access token —
+                # colliding JWTs across accounts would wipe good ones).
                 uid = entry.get("user_id") or entry.get("principal_id")
-                token = entry.get("key")
                 for k in list(m.keys()):
                     if k == aid:
                         continue
@@ -1230,21 +1367,13 @@ def refresh_all_accounts(
                         uid
                         and (v.get("user_id") == uid or v.get("principal_id") == uid)
                     )
-                    same_token = bool(token and v.get("key") == token)
-                    if same_user or same_token:
+                    if same_user:
                         del m[k]
                 m[aid] = entry
-            # Drop permanently invalid refresh-token accounts completely.
+            # Hard-delete path only (opt-in). Soft path already mutated above.
             for aid in delete_set:
                 if aid in m:
                     del m[aid]
-                # Also drop any remounted key that shares the same storage id tail.
-                for k in list(m.keys()):
-                    if k == aid:
-                        continue
-                    if k.endswith(aid) or aid.endswith(k):
-                        # be conservative: only exact match already handled
-                        pass
 
         try:
             mutate_auth_map(_apply)
@@ -1258,9 +1387,9 @@ def refresh_all_accounts(
                 "attempted": len(candidates),
                 "invalidated": len(invalid_marks),
                 "deleted": 0,
+                "disabled": 0,
             }
 
-        # Best-effort: clean pool meta / redis cooldown for deleted accounts.
         if deleted_ids:
             try:
                 from settings_store import get_account_pool_state, save_account_pool_state
@@ -1283,8 +1412,16 @@ def refresh_all_accounts(
                 except Exception:
                     pass
             print(
-                f"  [token-refresh] deleted {len(deleted_ids)} account(s) "
-                f"with permanently invalid refresh_token"
+                f"  [token-refresh] HARD-deleted {len(deleted_ids)} account(s) "
+                f"with permanently invalid refresh_token "
+                f"(GROK2API_DELETE_INVALID_REFRESH=1)",
+                flush=True,
+            )
+        if disabled_ids:
+            print(
+                f"  [token-refresh] soft-disabled {len(disabled_ids)} account(s) "
+                f"with permanently invalid refresh_token",
+                flush=True,
             )
 
     # Mark attempted accounts as covered for this sweep generation (success or fail).
@@ -1307,19 +1444,24 @@ def refresh_all_accounts(
         "deferred": deferred,
         "attempted": len(candidates),
         "workers": workers,
-        "invalidated": len(deleted_ids) or sum(
-            1 for r in results if r.get("permanent") or r.get("reason") in (
-                "refresh_invalid", "refresh_invalid_deleted"
-            )
-        ),
+        "invalidated": len(invalid_marks),
         "deleted": len(deleted_ids),
+        "disabled": len(disabled_ids),
         "deleted_ids": deleted_ids[:50],
+        "disabled_ids": disabled_ids[:50],
     }
     if deleted_reasons:
-        out["deleted_sample"] = [
+        sample_ids = (deleted_ids or disabled_ids)[:5]
+        out["invalid_sample"] = [
             {"id": aid, "reason": (deleted_reasons.get(aid) or "")[:160]}
-            for aid in deleted_ids[:5]
+            for aid in sample_ids
         ]
+        # Keep deleted_sample for older admin UIs when hard-delete is on.
+        if deleted_ids:
+            out["deleted_sample"] = [
+                {"id": aid, "reason": (deleted_reasons.get(aid) or "")[:160]}
+                for aid in deleted_ids[:5]
+            ]
     if sweep_info is not None:
         out["sweep"] = sweep_info
     if wanted is not None:
@@ -1327,17 +1469,25 @@ def refresh_all_accounts(
     return out
 
 
-def purge_refresh_invalid_accounts(*, dry_run: bool = False) -> dict[str, Any]:
-    """Delete permanently unusable accounts.
+def purge_refresh_invalid_accounts(
+    *,
+    dry_run: bool = False,
+    hard_delete: bool | None = None,
+) -> dict[str, Any]:
+    """Handle permanently unusable accounts.
 
-    Removes:
+    Default (safe): soft-disable only
+      - mark ``refresh_invalid``
+      - remove from rotation (enabled=False)
+      - keep credentials so a false positive can be re-enabled / re-imported
+
+    Hard delete only when ``hard_delete=True`` or
+    ``GROK2API_DELETE_INVALID_REFRESH=1``.
+
+    Targets:
       1. accounts already marked ``refresh_invalid``
       2. accounts with neither refresh_token nor access token
       3. accounts with no refresh_token whose access token is already expired
-         (or missing expires_at and unusable)
-
-    Safe to re-run (idempotent). Used at startup and by the background
-    token maintainer.
     """
     data = read_auth_map()
     doomed: list[tuple[str, str]] = []
@@ -1362,78 +1512,113 @@ def purge_refresh_invalid_accounts(*, dry_run: bool = False) -> dict[str, Any]:
             continue
         if not has_rt:
             # No RT: if access is already expired (or cannot be parsed as live),
-            # this account can never be renewed — delete it.
+            # this account can never be renewed.
             exp = parse_expires_at(entry.get("expires_at"), token)
             if exp is None:
-                # No expires_at and no RT — treat as dead weight once access is
-                # missing/empty; if access exists without exp we keep it (rare).
                 if not has_access:
                     doomed.append((aid, "no_refresh_token_and_no_expiry"))
                 continue
             if float(exp) <= now:
                 doomed.append((aid, "no_refresh_token_and_access_expired"))
 
+    do_hard = _hard_delete_invalid_refresh_enabled() if hard_delete is None else bool(hard_delete)
     if dry_run:
         return {
             "ok": True,
             "dry_run": True,
-            "would_delete": len(doomed),
+            "would_delete": len(doomed) if do_hard else 0,
+            "would_disable": 0 if do_hard else len(doomed),
+            "hard_delete": do_hard,
             "ids": [a for a, _ in doomed[:100]],
             "sample": [{"id": a, "reason": r[:160]} for a, r in doomed[:5]],
         }
     if not doomed:
-        return {"ok": True, "deleted": 0, "ids": [], "sample": []}
+        return {
+            "ok": True,
+            "deleted": 0,
+            "disabled": 0,
+            "ids": [],
+            "sample": [],
+            "hard_delete": do_hard,
+        }
 
     ids = [a for a, _ in doomed]
-    try:
-        from accounts import remove_accounts
-
-        result = remove_accounts(ids)
-        removed = list(result.get("removed") or ids)
-    except Exception:
-        # Fallback: direct map rewrite
-        def _apply(m: dict[str, Any]) -> None:
-            for aid in ids:
-                m.pop(aid, None)
-
-        mutate_auth_map(_apply)
-        removed = ids
-
-    # Pool / redis cleanup
-    try:
-        from settings_store import get_account_pool_state, save_account_pool_state
-
-        state = get_account_pool_state()
-        changed = False
-        for aid in removed:
-            if aid in state:
-                state.pop(aid, None)
-                changed = True
-        if changed:
-            save_account_pool_state(state)
-    except Exception:
-        pass
-    for aid in removed:
-        try:
-            from store.pool_redis import clear_cooldown
-
-            clear_cooldown(aid)
-        except Exception:
-            pass
-
     by_reason: dict[str, int] = {}
     for _aid, reason in doomed:
         key = str(reason or "unknown").split(":")[0][:64]
         by_reason[key] = by_reason.get(key, 0) + 1
+
+    if do_hard:
+        try:
+            from accounts import remove_accounts
+
+            result = remove_accounts(ids)
+            removed = list(result.get("removed") or ids)
+        except Exception:
+            def _apply(m: dict[str, Any]) -> None:
+                for aid in ids:
+                    m.pop(aid, None)
+
+            mutate_auth_map(_apply)
+            removed = ids
+
+        try:
+            from settings_store import get_account_pool_state, save_account_pool_state
+
+            state = get_account_pool_state()
+            changed = False
+            for aid in removed:
+                if aid in state:
+                    state.pop(aid, None)
+                    changed = True
+            if changed:
+                save_account_pool_state(state)
+        except Exception:
+            pass
+        for aid in removed:
+            try:
+                from store.pool_redis import clear_cooldown
+
+                clear_cooldown(aid)
+            except Exception:
+                pass
+        print(
+            f"  [token-refresh] HARD-purged {len(removed)} permanently invalid account(s)"
+            + (f" reasons={by_reason}" if by_reason else ""),
+            flush=True,
+        )
+        return {
+            "ok": True,
+            "deleted": len(removed),
+            "disabled": 0,
+            "ids": removed[:100],
+            "sample": [{"id": a, "reason": r[:160]} for a, r in doomed[:5]],
+            "by_reason": by_reason,
+            "hard_delete": True,
+            "action": "deleted",
+        }
+
+    # Soft path: mark + disable, keep credentials.
+    disabled = 0
+    for aid, reason in doomed:
+        try:
+            res = mark_refresh_invalid(aid, reason=reason, hard_delete=False)
+            if res.get("ok"):
+                disabled += 1
+        except Exception:
+            continue
     print(
-        f"  [token-refresh] purged {len(removed)} permanently invalid account(s)"
+        f"  [token-refresh] soft-disabled {disabled} permanently invalid account(s)"
         + (f" reasons={by_reason}" if by_reason else ""),
         flush=True,
     )
     return {
         "ok": True,
-        "deleted": len(removed),
-        "ids": removed[:100],
+        "deleted": 0,
+        "disabled": disabled,
+        "ids": ids[:100],
         "sample": [{"id": a, "reason": r[:160]} for a, r in doomed[:5]],
         "by_reason": by_reason,
+        "hard_delete": False,
+        "action": "disabled",
     }

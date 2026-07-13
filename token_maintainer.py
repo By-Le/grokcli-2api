@@ -27,9 +27,10 @@ _MIN_REMAINING_CACHE_TTL = 15.0
 
 def _interval() -> float:
     try:
-        return max(60.0, float(os.getenv("GROK2API_TOKEN_MAINTAIN_INTERVAL", "180")))
+        # Allow 30s+ so operators can run faster recovery batches (e.g. 90s).
+        return max(30.0, float(os.getenv("GROK2API_TOKEN_MAINTAIN_INTERVAL", "90")))
     except ValueError:
-        return 180.0
+        return 90.0
 
 
 def _skew() -> float:
@@ -125,18 +126,25 @@ def run_once(*, force: bool = False) -> dict[str, Any]:
             from oidc_auth import normalize_auth_file_keys, refresh_all_accounts
 
             result["normalized"] = normalize_auth_file_keys()
-            # Opportunistic purge of permanently unusable accounts:
+            # Opportunistic cleanup of permanently unusable accounts:
             # refresh_invalid marks, no-RT+no-access, no-RT+access-expired.
+            # Default soft-disable (keep credentials); hard delete only with env.
             try:
                 from oidc_auth import purge_refresh_invalid_accounts
 
                 purged = purge_refresh_invalid_accounts(dry_run=False)
                 result["purged_dead"] = {
                     "deleted": int((purged or {}).get("deleted") or 0),
+                    "disabled": int((purged or {}).get("disabled") or 0),
+                    "action": (purged or {}).get("action") or "disabled",
                     "by_reason": (purged or {}).get("by_reason") or {},
                 }
             except Exception as e:  # noqa: BLE001
-                result["purged_dead"] = {"deleted": 0, "error": str(e)[:200]}
+                result["purged_dead"] = {
+                    "deleted": 0,
+                    "disabled": 0,
+                    "error": str(e)[:200],
+                }
             # force: still only-near-expiry=False, but max_accounts batch applies
             # Background cycles use a generous skew so already-expired tokens are
             # always candidates; near-expiry (~15m) is also included.
@@ -268,12 +276,17 @@ def run_once(*, force: bool = False) -> dict[str, Any]:
             refreshed = int(rf.get("refreshed") or 0)
             attempted = int(rf.get("attempted") or refreshed or 0)
             failed = int(rf.get("failed") or 0)
-            deleted = int(rf.get("deleted") or rf.get("invalidated") or 0)
+            deleted = int(rf.get("deleted") or 0)
+            disabled = int(rf.get("disabled") or rf.get("invalidated") or 0)
             purged = 0
+            purged_disabled = 0
             try:
-                purged = int(((slim_last.get("purged_dead") or {}) or {}).get("deleted") or 0)
+                pd = (slim_last.get("purged_dead") or {}) or {}
+                purged = int(pd.get("deleted") or 0)
+                purged_disabled = int(pd.get("disabled") or 0)
             except Exception:
                 purged = 0
+                purged_disabled = 0
             meaningful = bool(
                 force
                 or slim_last.get("ok") is False
@@ -281,15 +294,24 @@ def run_once(*, force: bool = False) -> dict[str, Any]:
                 or refreshed
                 or failed
                 or deleted
+                or disabled
                 or purged
+                or purged_disabled
                 or slim_last.get("error")
             )
             if meaningful:
+                cleanup_n = deleted or purged
+                disable_n = disabled or purged_disabled
+                extra = ""
+                if cleanup_n:
+                    extra += f" · 硬删除 {cleanup_n}"
+                elif disable_n:
+                    extra += f" · 移出轮询 {disable_n}"
                 summary = (
                     f"Token 续期{'（强制）' if force else ''}："
                     f"刷新 {refreshed}/{attempted or refreshed}"
                     f" · 失败 {failed}"
-                    + (f" · 清理 {deleted or purged}" if (deleted or purged) else "")
+                    + extra
                 )
                 st = "done"
                 if failed and refreshed:
@@ -414,16 +436,18 @@ def status(*, light: bool = False) -> dict[str, Any]:
         is_leader = bool(_is_leader())
         ls = _leader_status()
         leader_id = ls.get("leader_id")
-        if is_enabled() and (local_running or (ls.get("is_leader") is False and leader_id)):
-            # If a leader id exists in this process view OR redis lock exists, treat as running when enabled.
-            cluster_running = True if is_enabled() else local_running
-        if not local_running and is_enabled():
+        if local_running:
+            cluster_running = True
+        elif is_enabled():
+            # Only claim cluster_running when a live Redis leader lock exists.
+            # A stale last_run snapshot alone must NOT report running=true.
             try:
                 from store.redis_client import get_str, key, redis_enabled
                 if redis_enabled():
                     lid = get_str(key("lock", "maintainer_leader"))
                     if lid:
                         leader_id = lid
+                        # Presence of lock key (with TTL) means some worker owns leadership.
                         cluster_running = True
             except Exception:
                 pass

@@ -2324,14 +2324,18 @@ const REG_MAIL_KEY_SLOTS = {
   moemail: "moemail_api_key",
   yyds: "yyds_api_key",
   gptmail: "gptmail_api_key",
+  cfmail: "cfmail_api_key",
 };
 const REG_MAIL_DOMAIN_SLOTS = {
   moemail: "moemail_domain",
   yyds: "yyds_domain",
   gptmail: "gptmail_domain",
+  cfmail: "cfmail_domain",
 };
-let regMailKeys = { moemail: "", yyds: "", gptmail: "" };
-let regMailDomains = { moemail: "", yyds: "", gptmail: "" };
+let regMailKeys = { moemail: "", yyds: "", gptmail: "", cfmail: "" };
+let regMailDomains = { moemail: "", yyds: "", gptmail: "", cfmail: "" };
+// Self-hosted hosts kept per provider so MoeMail / CF never overwrite each other.
+let regMailBaseUrls = { moemail: "", cfmail: "" };
 let regMailProviderPrev = "moemail";
 
 function currentRegMailProvider() {
@@ -2340,6 +2344,7 @@ function currentRegMailProvider() {
     : "moemail";
   if (mail === "yyds") return "yyds";
   if (mail === "gptmail") return "gptmail";
+  if (mail === "cfmail") return "cfmail";
   return "moemail";
 }
 
@@ -2350,6 +2355,9 @@ function stashRegMailFieldsFromInput() {
   }
   if ($("reg-domain")) {
     regMailDomains[mail] = $("reg-domain").value || "";
+  }
+  if ($("reg-base-url") && (mail === "moemail" || mail === "cfmail")) {
+    regMailBaseUrls[mail] = $("reg-base-url").value || "";
   }
 }
 
@@ -2367,18 +2375,30 @@ function syncRegMailProviderUI() {
   }
   const isYyds = mail === "yyds";
   const isGpt = mail === "gptmail";
+  const isCf = mail === "cfmail";
   const isMoe = mail === "moemail";
   const isTemp24h = isYyds || isGpt;
 
   // YYDS / GPTMail use fixed official hosts — hide URL field entirely.
+  // MoeMail / CF Temp Email are self-hosted — show URL field with per-provider value.
   if ($("reg-base-url-wrap")) {
-    $("reg-base-url-wrap").style.display = isMoe ? "" : "none";
+    $("reg-base-url-wrap").style.display = (isMoe || isCf) ? "" : "none";
   }
   if ($("reg-base-url-label")) {
-    $("reg-base-url-label").textContent = "MoeMail Base URL";
+    $("reg-base-url-label").textContent = isCf
+      ? "CF Temp Email Base URL"
+      : "MoeMail Base URL";
   }
-  if ($("reg-base-url") && isMoe) {
-    $("reg-base-url").placeholder = "https://moemail.example.com";
+  if ($("reg-base-url")) {
+    if (isMoe || isCf) {
+      $("reg-base-url").placeholder = isCf
+        ? "https://your-worker.example.workers.dev"
+        : "https://moemail.example.com";
+      // Restore this provider's host only — never the other self-hosted host.
+      $("reg-base-url").value = regMailBaseUrls[mail] || "";
+    } else {
+      $("reg-base-url").value = "";
+    }
   }
 
   if ($("reg-api-key-label")) {
@@ -2386,14 +2406,18 @@ function syncRegMailProviderUI() {
       ? "YYDS API Key"
       : isGpt
         ? "GPTMail API Key"
-        : "MoeMail API Key";
+        : isCf
+          ? "CF Temp Email Admin 密码"
+          : "MoeMail API Key";
   }
   if ($("reg-api-key")) {
     $("reg-api-key").placeholder = isYyds
       ? "AC-..."
       : isGpt
         ? "sk-...（自有 Key）"
-        : "mk_...";
+        : isCf
+          ? "管理后台密码（x-admin-auth）"
+          : "mk_...";
     // Show the key stored for this provider only.
     $("reg-api-key").value = regMailKeys[mail] || "";
   }
@@ -2402,14 +2426,18 @@ function syncRegMailProviderUI() {
       ? "YYDS 邮箱域名"
       : isGpt
         ? "GPTMail 邮箱域名"
-        : "MoeMail 邮箱域名";
+        : isCf
+          ? "CF Temp Email 域名"
+          : "MoeMail 邮箱域名";
   }
   if ($("reg-domain")) {
     $("reg-domain").placeholder = isYyds
       ? "留空则自动随机获取公开域名"
       : isGpt
         ? "可选；留空由 GPTMail 随机分配"
-        : "example.com";
+        : isCf
+          ? "可选；留空从 /open_api/settings 自动选"
+          : "example.com";
     // Show the domain stored for this provider only.
     $("reg-domain").value = regMailDomains[mail] || "";
   }
@@ -2443,23 +2471,32 @@ function readRegConfig() {
   regMailProviderPrev = mailProvider;
   const activeKey = regMailKeys[mailProvider] || "";
   const activeDomain = regMailDomains[mailProvider] || "";
+  // Keep self-hosted hosts in dedicated slots so save never mixes them.
+  if (mailProvider === "moemail" || mailProvider === "cfmail") {
+    regMailBaseUrls[mailProvider] = $("reg-base-url") ? ($("reg-base-url").value || "").trim() : (regMailBaseUrls[mailProvider] || "");
+  }
+  const activeBase =
+    mailProvider === "moemail" || mailProvider === "cfmail"
+      ? (regMailBaseUrls[mailProvider] || "")
+      : "";
   return {
     mail_provider: mailProvider,
-    // Only MoeMail needs a user-supplied base URL.
-    base_url:
-      mailProvider === "moemail"
-        ? ($("reg-base-url") ? $("reg-base-url").value.trim() : "")
-        : "",
+    // Active host mirrors the selected self-hosted provider.
+    base_url: activeBase,
+    moemail_base_url: regMailBaseUrls.moemail || "",
+    cfmail_base_url: regMailBaseUrls.cfmail || "",
     domain: activeDomain,
     moemail_domain: regMailDomains.moemail || "",
     yyds_domain: regMailDomains.yyds || "",
     gptmail_domain: regMailDomains.gptmail || "",
+    cfmail_domain: regMailDomains.cfmail || "",
     expiry_ms: $("reg-expiry-ms") ? $("reg-expiry-ms").value.trim() : "",
     // Active key + all per-provider keys (empty keeps previous secret server-side).
     api_key: activeKey,
     moemail_api_key: regMailKeys.moemail || "",
     yyds_api_key: regMailKeys.yyds || "",
     gptmail_api_key: regMailKeys.gptmail || "",
+    cfmail_api_key: regMailKeys.cfmail || "",
     captcha_provider: isLocal ? "local" : "yescaptcha",
     // Inline local solver is fixed; do not accept/show custom URL.
     local_solver_url: isLocal ? "http://127.0.0.1:5072" : "",
@@ -2505,7 +2542,7 @@ function normalizeRegExpiryMs(value) {
 function applyRegConfig(cfg) {
   if (!cfg || typeof cfg !== "object") return;
   const mail = String(cfg.mail_provider || cfg.provider || "moemail").trim().toLowerCase();
-  const mailProv = mail === "yyds" ? "yyds" : mail === "gptmail" ? "gptmail" : "moemail";
+  const mailProv = mail === "yyds" ? "yyds" : mail === "gptmail" ? "gptmail" : mail === "cfmail" ? "cfmail" : "moemail";
   if ($("reg-mail-provider")) {
     $("reg-mail-provider").value = mailProv;
   }
@@ -2527,6 +2564,10 @@ function applyRegConfig(cfg) {
       cfg.gptmail_api_key != null && cfg.gptmail_api_key !== ""
         ? String(cfg.gptmail_api_key)
         : (mailProv === "gptmail" ? activeKey : (regMailKeys.gptmail || "")),
+    cfmail:
+      cfg.cfmail_api_key != null && cfg.cfmail_api_key !== ""
+        ? String(cfg.cfmail_api_key)
+        : (mailProv === "cfmail" ? activeKey : (regMailKeys.cfmail || "")),
   };
   // Domain: if the dedicated field is present (including empty string from server),
   // honor it. Empty means cleared — do not restore from cache/localStorage.
@@ -2543,6 +2584,7 @@ function applyRegConfig(cfg) {
     moemail: pickDomain("moemail_domain", mailProv === "moemail"),
     yyds: pickDomain("yyds_domain", mailProv === "yyds"),
     gptmail: pickDomain("gptmail_domain", mailProv === "gptmail"),
+    cfmail: pickDomain("cfmail_domain", mailProv === "cfmail"),
   };
   // If server returned empty dedicated slot for active provider, force empty.
   if (mailProv === "yyds" && Object.prototype.hasOwnProperty.call(cfg, "yyds_domain")) {
@@ -2551,13 +2593,37 @@ function applyRegConfig(cfg) {
   if (mailProv === "gptmail" && Object.prototype.hasOwnProperty.call(cfg, "gptmail_domain")) {
     regMailDomains.gptmail = cfg.gptmail_domain == null ? "" : String(cfg.gptmail_domain);
   }
+  if (mailProv === "cfmail" && Object.prototype.hasOwnProperty.call(cfg, "cfmail_domain")) {
+    regMailDomains.cfmail = cfg.cfmail_domain == null ? "" : String(cfg.cfmail_domain);
+  }
   if (mailProv === "moemail" && Object.prototype.hasOwnProperty.call(cfg, "moemail_domain")) {
     regMailDomains.moemail = cfg.moemail_domain == null ? "" : String(cfg.moemail_domain);
   }
   regMailProviderPrev = mailProv;
-  // Only show/edit base_url for MoeMail.
+  // Hydrate per-provider hosts independently.
+  const pickBase = (slotKey, isActive) => {
+    if (Object.prototype.hasOwnProperty.call(cfg, slotKey)) {
+      return cfg[slotKey] == null ? "" : String(cfg[slotKey]);
+    }
+    if (isActive && Object.prototype.hasOwnProperty.call(cfg, "base_url")) {
+      return cfg.base_url == null ? "" : String(cfg.base_url);
+    }
+    return regMailBaseUrls[slotKey.replace("_base_url", "")] || "";
+  };
+  regMailBaseUrls = {
+    moemail: pickBase("moemail_base_url", mailProv === "moemail"),
+    cfmail: pickBase("cfmail_base_url", mailProv === "cfmail"),
+  };
+  if (mailProv === "moemail" && Object.prototype.hasOwnProperty.call(cfg, "moemail_base_url")) {
+    regMailBaseUrls.moemail = cfg.moemail_base_url == null ? "" : String(cfg.moemail_base_url);
+  }
+  if (mailProv === "cfmail" && Object.prototype.hasOwnProperty.call(cfg, "cfmail_base_url")) {
+    regMailBaseUrls.cfmail = cfg.cfmail_base_url == null ? "" : String(cfg.cfmail_base_url);
+  }
   if ($("reg-base-url")) {
-    $("reg-base-url").value = mailProv === "moemail" ? (cfg.base_url || "") : "";
+    $("reg-base-url").value = (mailProv === "moemail" || mailProv === "cfmail")
+      ? (regMailBaseUrls[mailProv] || "")
+      : "";
   }
   if ($("reg-domain")) {
     $("reg-domain").value = regMailDomains[mailProv] || "";
@@ -2626,9 +2692,22 @@ async function saveRegConfig() {
       if (!Object.prototype.hasOwnProperty.call(saved, "domain")) saved.domain = cfg.domain || "";
       if (!Object.prototype.hasOwnProperty.call(saved, "gptmail_api_key")) saved.gptmail_api_key = cfg.gptmail_api_key || "";
       if (!Object.prototype.hasOwnProperty.call(saved, "api_key")) saved.api_key = cfg.api_key || "";
+    } else if (mail === "cfmail") {
+      if (!Object.prototype.hasOwnProperty.call(saved, "cfmail_domain")) saved.cfmail_domain = cfg.cfmail_domain || "";
+      if (!Object.prototype.hasOwnProperty.call(saved, "domain")) saved.domain = cfg.domain || "";
+      if (!Object.prototype.hasOwnProperty.call(saved, "cfmail_api_key")) saved.cfmail_api_key = cfg.cfmail_api_key || "";
+      if (!Object.prototype.hasOwnProperty.call(saved, "api_key")) saved.api_key = cfg.api_key || "";
+      if (!Object.prototype.hasOwnProperty.call(saved, "base_url")) saved.base_url = cfg.base_url || "";
+      if (!Object.prototype.hasOwnProperty.call(saved, "cfmail_base_url")) saved.cfmail_base_url = cfg.cfmail_base_url || cfg.base_url || "";
+      // Never lose the other self-hosted host when saving CF.
+      if (!Object.prototype.hasOwnProperty.call(saved, "moemail_base_url")) saved.moemail_base_url = cfg.moemail_base_url || "";
     } else {
       if (!Object.prototype.hasOwnProperty.call(saved, "moemail_domain")) saved.moemail_domain = cfg.moemail_domain || "";
       if (!Object.prototype.hasOwnProperty.call(saved, "domain")) saved.domain = cfg.domain || "";
+      if (!Object.prototype.hasOwnProperty.call(saved, "base_url")) saved.base_url = cfg.base_url || "";
+      if (!Object.prototype.hasOwnProperty.call(saved, "moemail_base_url")) saved.moemail_base_url = cfg.moemail_base_url || cfg.base_url || "";
+      // Never lose CF host when saving MoeMail.
+      if (!Object.prototype.hasOwnProperty.call(saved, "cfmail_base_url")) saved.cfmail_base_url = cfg.cfmail_base_url || "";
     }
     applyRegConfig(saved);
     cacheRegConfigLocal(saved);
@@ -2698,12 +2777,21 @@ function buildRegBody(config) {
       ? "yyds"
       : mailProvider === "gptmail"
         ? "gptmail"
-        : "moemail";
+        : mailProvider === "cfmail"
+          ? "cfmail"
+          : "moemail";
   // Keep legacy field for older backends.
   body.provider = body.mail_provider;
-  // Only MoeMail needs base_url; YYDS/GPTMail use fixed hosts server-side.
-  if (body.mail_provider === "moemail" && config.base_url) {
-    body.base_url = config.base_url;
+  // MoeMail + CF Temp Email need base_url; YYDS/GPTMail use fixed hosts.
+  // Always send dedicated host slots (including empty) so saves stay isolated.
+  body.moemail_base_url = config.moemail_base_url == null ? "" : String(config.moemail_base_url);
+  body.cfmail_base_url = config.cfmail_base_url == null ? "" : String(config.cfmail_base_url);
+  if (body.mail_provider === "moemail") {
+    body.base_url = body.moemail_base_url || (config.base_url == null ? "" : String(config.base_url));
+    body.moemail_base_url = body.base_url;
+  } else if (body.mail_provider === "cfmail") {
+    body.base_url = body.cfmail_base_url || (config.base_url == null ? "" : String(config.base_url));
+    body.cfmail_base_url = body.base_url;
   }
   // Always send domain for the active provider (empty clears/auto).
   body.domain = config.domain == null ? "" : String(config.domain);
@@ -2728,6 +2816,9 @@ function buildRegBody(config) {
   } else if (body.mail_provider === "gptmail") {
     body.gptmail_api_key = config.gptmail_api_key == null ? body.api_key : String(config.gptmail_api_key);
     body.gptmail_domain = config.gptmail_domain == null ? body.domain : String(config.gptmail_domain);
+  } else if (body.mail_provider === "cfmail") {
+    body.cfmail_api_key = config.cfmail_api_key == null ? body.api_key : String(config.cfmail_api_key);
+    body.cfmail_domain = config.cfmail_domain == null ? body.domain : String(config.cfmail_domain);
   }
   const provider = String(config.captcha_provider || "local").trim().toLowerCase();
   body.captcha_provider = provider === "yescaptcha" ? "yescaptcha" : "local";
