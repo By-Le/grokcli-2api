@@ -2,14 +2,14 @@
 
 把 **Grok OIDC 登录态** 转成 **OpenAI / Anthropic 兼容 API**，并附带 Web 管理台：多 API Key、多账号轮询、设备码 / SSO / JSON 导入导出、协议注册。
 
-**当前版本：v1.9.88** · 使用明细展示思考强度 · Token 过期移出轮询 · SSO 续期自愈
+**当前版本：v1.9.89** · 使用明细展示思考强度 · Token 过期移出轮询 · SSO 续期自愈
 
 [![GHCR](https://img.shields.io/badge/ghcr.io-hm2899%2Fgrokcli--2api-blue)](https://github.com/users/HM2899/packages/container/package/grokcli-2api)
 [![Release](https://img.shields.io/github/v/release/HM2899/grokcli-2api?display_name=tag)](https://github.com/HM2899/grokcli-2api/releases)
 
 | 镜像（全小写） | 说明 |
 |----------------|------|
-| `ghcr.io/hm2899/grokcli-2api:1.9.88` | 当前版本 |
+| `ghcr.io/hm2899/grokcli-2api:1.9.89` | 当前版本 |
 | `ghcr.io/hm2899/grokcli-2api:latest` | 最近 `v*` tag |
 | `ghcr.io/hm2899/grokcli-2api:edge` | `main` 最新 |
 
@@ -68,11 +68,11 @@
 
 ---
 
-## 本版本重点（v1.9.88）
+## 本版本重点（v1.9.89）
 
 | 能力 | 行为 |
 |------|------|
-| **使用明细 · 思考强度** | 管理台「使用明细」新增「思考强度」列：低 / 中 / 高 / 极高 |
+| **使用明细 · 思考强度** | 管理台「使用明细」新增「思考强度」列：`low` / `medium` / `high` / `xhigh` |
 | **协议覆盖** | OpenAI `reasoning_effort` · Anthropic `thinking` / `budget_tokens` · Responses `reasoning.effort` |
 | **落库** | 写入 usage event `detail.reasoning_effort`（兼容 `thinking_intensity`）；列表接口透出 |
 | **预算映射** | Anthropic `budget_tokens` 与上游一致：≤4k low · ≤16k medium · ≤48k high · 更大 xhigh |
@@ -162,7 +162,7 @@ ghcr.io/hm2899/grokcli-2api
 **正确示例：**
 
 ```bash
-docker pull ghcr.io/hm2899/grokcli-2api:1.9.88
+docker pull ghcr.io/hm2899/grokcli-2api:1.9.89
 # 或
 docker pull ghcr.io/hm2899/grokcli-2api:latest
 ```
@@ -201,7 +201,7 @@ services:
       retries: 10
 
   grokcli-2api:
-    image: ghcr.io/hm2899/grokcli-2api:1.9.88
+    image: ghcr.io/hm2899/grokcli-2api:1.9.89
     ports:
       # 只映射应用；不要给 postgres/redis 加 ports
       - "3000:3000"
@@ -450,13 +450,13 @@ docker exec grokcli-2api sh -c 'echo TZ=$TZ; date'
 ```bash
 # 1) app.py 中 APP_VERSION 必须与 git tag 一致（镜像路径全小写）
 # 2) 推 main → edge + 版本号；推 v* tag → 额外 latest + GitHub Release
-git add -A && git commit -m "release: v1.9.88"
+git add -A && git commit -m "release: v1.9.89"
 git push origin main
-git tag -a v1.9.88 -m "v1.9.88"
-git push origin v1.9.88
-gh release create v1.9.88 --title "v1.9.88 使用明细思考强度" --notes-file - <<'EOF'
+git tag -a v1.9.89 -m "v1.9.89"
+git push origin v1.9.89
+gh release create v1.9.89 --title "v1.9.89 usage detail effort English labels" --notes-file - <<'EOF'
 ## Highlights
-- 使用明细新增思考强度列（低/中/高/极高）
+- 使用明细新增思考强度列（low / medium / high / xhigh）
 - 记录 OpenAI / Anthropic / Responses 请求的 reasoning_effort
 - 兼容 budget_tokens → effort 映射
 EOF
@@ -467,7 +467,7 @@ gh run list --workflow=docker-publish.yml --limit 3
 成功后拉取（**必须小写**）：
 
 ```bash
-docker pull ghcr.io/hm2899/grokcli-2api:1.9.88
+docker pull ghcr.io/hm2899/grokcli-2api:1.9.89
 docker pull ghcr.io/hm2899/grokcli-2api:latest
 ```
 
@@ -525,8 +525,8 @@ turnstile-solver/                        # 本地过盾（内联）
 
 ## 版本
 
-- **v1.9.88**（当前）
-  - **使用明细 · 思考强度**：管理台「使用明细」展示 low/medium/high/xhigh（低/中/高/极高）
+- **v1.9.89**（当前）
+  - **使用明细 · 思考强度**：管理台「使用明细」直接展示英文标签 low / medium / high / xhigh
   - 从 OpenAI `reasoning_effort`、Anthropic `thinking`/`budget_tokens`、Responses `reasoning.effort` 提取并写入 usage detail
   - 列表接口透出 `reasoning_effort`；点击行可看完整字段
   - 继承 v1.9.87：Token 过期移出轮询 · SSO 续期自愈 · 首页状态统计

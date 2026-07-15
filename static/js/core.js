@@ -6476,24 +6476,19 @@ async function loadUsageEvents({ reset = false } = {}) {
         || (it.detail && (it.detail.reasoning_effort || it.detail.thinking_intensity || it.detail.thinking_effort))
         || ""
       );
+      // Show canonical English labels (low / medium / high / xhigh).
       const effort = String(effortRaw || "").trim().toLowerCase();
-      const effortLabel = {
-        low: "低",
-        medium: "中",
-        high: "高",
-        xhigh: "极高",
-      }[effort] || (effort ? effort : "—");
       let effortPill;
       if (!effort) {
         effortPill = '<span class="g2a-muted">—</span>';
       } else if (effort === "low") {
-        effortPill = `<span class="g2a-tag" title="thinking intensity: ${esc(effort)}">${esc(effortLabel)}</span>`;
+        effortPill = `<span class="g2a-tag" title="reasoning_effort: ${esc(effort)}">${esc(effort)}</span>`;
       } else if (effort === "medium") {
-        effortPill = `<span class="g2a-tag warn" title="thinking intensity: ${esc(effort)}">${esc(effortLabel)}</span>`;
+        effortPill = `<span class="g2a-tag warn" title="reasoning_effort: ${esc(effort)}">${esc(effort)}</span>`;
       } else if (effort === "high" || effort === "xhigh") {
-        effortPill = `<span class="g2a-tag bad" title="thinking intensity: ${esc(effort)}">${esc(effortLabel)}</span>`;
+        effortPill = `<span class="g2a-tag bad" title="reasoning_effort: ${esc(effort)}">${esc(effort)}</span>`;
       } else {
-        effortPill = `<span class="g2a-tag" title="thinking intensity: ${esc(effort)}">${esc(effortLabel)}</span>`;
+        effortPill = `<span class="g2a-tag" title="reasoning_effort: ${esc(effort)}">${esc(effort)}</span>`;
       }
       const ttftMs = it.ttft_ms != null
         ? it.ttft_ms
