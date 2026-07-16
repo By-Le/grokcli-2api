@@ -11,7 +11,7 @@ import (
 )
 
 func TestAdminWriteRoutesGated(t *testing.T) {
-	for _, path := range []string{"/admin/api/login", "/admin/api/setup", "/admin/api/keys", "/admin/api/accounts/x/kick", "/admin/api/settings"} {
+	for _, path := range []string{"/admin/api/login", "/admin/api/setup", "/admin/api/keys", "/admin/api/accounts/x/kick"} {
 		rec := httptest.NewRecorder()
 		NewMux(Options{Ready: func() bool { return true }}).ServeHTTP(rec, httptest.NewRequest(http.MethodPost, path, strings.NewReader(`{}`)))
 		if rec.Code != http.StatusServiceUnavailable {
@@ -45,5 +45,14 @@ func TestAdminSessionUnauthorized(t *testing.T) {
 	_ = json.Unmarshal(rec.Body.Bytes(), &body)
 	if body["authenticated"] != false {
 		t.Fatalf("body %#v", body)
+	}
+}
+
+func TestAdminSettingsWriteGated(t *testing.T) {
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodPatch, "/admin/api/settings", strings.NewReader(`{"outbound_max_tools":1}`))
+	NewMux(Options{Ready: func() bool { return true }}).ServeHTTP(rec, req)
+	if rec.Code != http.StatusServiceUnavailable {
+		t.Fatalf("settings patch disabled = %d body=%s", rec.Code, rec.Body.String())
 	}
 }
