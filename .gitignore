@@ -32,6 +32,10 @@ docker-rebuild.local.sh
 .claude/
 .release-commit
 
+# Built Go binaries (source lives under cmd/; do not ignore grok2api/ package dir)
+/grok2api-migrate
+/bin/
+
 # Accidental local data dir name / backups
 GROK2API_DATA_DIR/
 *.bak

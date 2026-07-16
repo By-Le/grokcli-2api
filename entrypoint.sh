@@ -1,13 +1,31 @@
 #!/usr/bin/env bash
 # Main container entrypoint:
 # 1) optionally start in-process Turnstile Solver on 127.0.0.1:5072
-# 2) start grokcli-2api (app.py)
+# 2) start grokcli-2api using the selected main runtime
 set -euo pipefail
 cd /app
 
-APP_CMD=("python" "app.py")
+runtime="$(echo "${GROK2API_RUNTIME:-python}" | tr '[:upper:]' '[:lower:]')"
+case "${runtime}" in
+  go)
+    APP_CMD=("/app/bin/grok2api")
+    ;;
+  python|"")
+    APP_CMD=("python" "app.py")
+    ;;
+  *)
+    echo "[entrypoint] invalid GROK2API_RUNTIME=${GROK2API_RUNTIME}; expected python or go" >&2
+    exit 2
+    ;;
+esac
 if [[ "$#" -gt 0 ]]; then
-  APP_CMD=("$@")
+  # Docker's default CMD is still `python app.py` for Python fallback. Do not let
+  # that default mask GROK2API_RUNTIME=go, but keep explicit command overrides.
+  if [[ "${runtime}" == "go" && "$#" -eq 2 && "$1" == "python" && "$2" == "app.py" ]]; then
+    :
+  else
+    APP_CMD=("$@")
+  fi
 fi
 
 provider="$(echo "${GROK2API_CAPTCHA_PROVIDER:-${CAPTCHA_PROVIDER:-local}}" | tr '[:upper:]' '[:lower:]')"
@@ -70,7 +88,9 @@ cleanup() {
 }
 trap cleanup EXIT INT TERM
 
-# Force local solver URL to loopback when using inline mode.
+# Force local solver URL to loopback when using inline mode. This only keeps the
+# existing registration/solver sidecar path available; the Go runtime does not
+# implement captcha solving or registration execution.
 if [[ "${provider}" == "local" && "${enable_solver}" != "0" ]]; then
   export GROK2API_CAPTCHA_PROVIDER=local
   export CAPTCHA_PROVIDER=local
@@ -79,5 +99,5 @@ if [[ "${provider}" == "local" && "${enable_solver}" != "0" ]]; then
   start_inline_solver
 fi
 
-echo "[entrypoint] starting app: ${APP_CMD[*]}"
+echo "[entrypoint] starting app (${runtime}): ${APP_CMD[*]}"
 exec "${APP_CMD[@]}"
