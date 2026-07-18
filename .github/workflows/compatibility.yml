@@ -54,7 +54,11 @@ jobs:
       - name: Run Go race tests
         run: go test -race ./...
       - name: Build migration-safe binary
-        run: go build ./cmd/grok2api
+        # Output must not be bare "grok2api" — that path is the Python package directory.
+        run: |
+          mkdir -p bin
+          go build -o bin/grok2api ./cmd/grok2api
+          go build -o bin/grok2api-migrate ./cmd/grok2api-migrate
       - name: Gate release version pins match
         run: |
           python - <<'PY2'
