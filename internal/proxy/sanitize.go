@@ -111,13 +111,21 @@ func PrepareUpstreamBody(body map[string]any) map[string]any {
 
 // PrepareUpstreamBodyDetailed returns the sanitized upstream body plus stabilize/compact stats.
 // Optional userAgent enables Codex default auto-compact when admin auto_chars is 0.
+//
+// Cache-safe body prep: stabilize + optional history compact, then strip
+// private keys. Do NOT inject client-specific instructions here — that would
+// mutate the prompt prefix and bust Grok prompt-cache hits. Codex detection
+// is used only for outbound shell key projection (cmd↔command), not for
+// rewriting instructions.
 func PrepareUpstreamBodyDetailed(body map[string]any, userAgent ...string) (map[string]any, BodyPrepStats) {
 	out := cloneAnyMap(body)
-	stabilize := StabilizePromptBody(out)
 	ua := ""
 	if len(userAgent) > 0 {
 		ua = userAgent[0]
 	}
+	// Intentionally no prompt injection (cache-safe). Codex shell key projection
+	// happens only on the outbound tool_call path.
+	stabilize := StabilizePromptBody(out)
 	compact := historycompact.Apply(out, ua)
 	return SanitizeUpstreamBody(out), BodyPrepStats{Stabilize: stabilize, Compact: compact}
 }
@@ -542,9 +550,9 @@ func hardenShellToolParameters(name string, params any) map[string]any {
 		props = cloneAnyMap(props)
 	}
 	// Keep existing command schema if present; always force a single STRING type.
-	// Array argv was allowed historically but trained models to emit array-shaped
-	// commands that then got POSIX-quoted for Codex PowerShell hosts (ParserError).
-	// String-only matches Codex Desktop local schema and reduces bad tool args.
+	// Array argv was allowed historically but trained Grok to emit argv that then
+	// got POSIX-quoted for Codex PowerShell hosts (ParserError). String-only
+	// matches Codex Desktop local schema and the gold-standard gateway.
 	cmdSchema, _ := props["command"].(map[string]any)
 	if cmdSchema == nil {
 		// Steal description from common wrong names if any.
