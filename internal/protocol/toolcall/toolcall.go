@@ -760,7 +760,7 @@ func shellQuoteToken(s string) string {
 	for i := 0; i < len(s); i++ {
 		c := s[i]
 		if (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') ||
-			c == '-' || c == '_' || c == '.' || c == '/' || c == '=' || c == ':' || c == '@' || c == '+' || c == '%' {
+			c == '-' || c == '_' || c == '.' || c == '/' || c == '\\' || c == '=' || c == ':' || c == '@' || c == '+' || c == '%' {
 			continue
 		}
 		safe = false
@@ -769,8 +769,13 @@ func shellQuoteToken(s string) string {
 	if safe {
 		return s
 	}
-	// POSIX single-quote: 'foo'\''bar'
-	return "'" + strings.ReplaceAll(s, "'", `'\''`) + "'"
+	// Prefer double-quote with "" escape. Bash-style '\'' around tokens like
+	// 'rg -n' makes PowerShell treat the first token as a string literal (not a
+	// command) and then ParserError on the next quoted fragment.
+	if !strings.Contains(s, "\"") {
+		return "\"" + s + "\""
+	}
+	return "\"" + strings.ReplaceAll(s, "\"", "\"\"") + "\""
 }
 
 func flattenCommandParts(parts []any) []string {
