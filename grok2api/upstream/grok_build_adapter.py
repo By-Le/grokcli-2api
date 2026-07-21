@@ -31,7 +31,7 @@ ROOT = Path(__file__).resolve().parents[2]
 GBA = ROOT / "grok-build-auth"
 DATA_DIR = ROOT / "data"
 REGISTER_SSO_DIR = DATA_DIR / "register_sso"
-ADAPTER_BUILD = "v1.9.94-reg-px-pass-harden"
+ADAPTER_BUILD = "v1.9.96-reg-mt-captcha-success"
 # Newly registered accounts often need a short settle window before probe.
 REGISTER_PROBE_DELAY_SEC = float(
     os.environ.get("GROK2API_REG_PROBE_DELAY_SEC", "30") or 30
@@ -61,17 +61,24 @@ LOCAL_SOLVER_URL = (
 
 # Hard cap for multi-thread registration concurrency only (YesCaptcha + xAI rate limits).
 # Batch count is intentionally uncapped — only concurrency bounds parallelism.
-# Keep low: each local-captcha worker can wait on Camoufox; 5+ browsers OOM.
-MAX_CONCURRENCY = int(os.environ.get("GROK2API_REG_MAX_CONCURRENCY", "4") or 4)
-DEFAULT_CONCURRENCY = int(os.environ.get("GROK2API_REG_CONCURRENCY", "2") or 2)
-# Hard cap when captcha_provider=local (Camoufox is ~200–400MB per browser).
+# Local Camoufox ≈ 200–400MB per browser; keep MAX <= TURNSTILE_THREAD_MAX.
+try:
+    MAX_CONCURRENCY = max(1, min(8, int(os.environ.get("GROK2API_REG_MAX_CONCURRENCY", "4") or 4)))
+except (TypeError, ValueError):
+    MAX_CONCURRENCY = 4
+try:
+    DEFAULT_CONCURRENCY = max(1, min(MAX_CONCURRENCY, int(os.environ.get("GROK2API_REG_CONCURRENCY", "3") or 3)))
+except (TypeError, ValueError):
+    DEFAULT_CONCURRENCY = 3
+# Hard cap when captcha_provider=local. Default 3 so multi-thread reg can use a
+# warm browser pool; override via GROK2API_REG_LOCAL_CONCURRENCY (1–6).
 try:
     LOCAL_CAPTCHA_MAX_CONCURRENCY = max(
         1,
-        min(4, int(os.environ.get("GROK2API_REG_LOCAL_CONCURRENCY", "2") or 2)),
+        min(6, int(os.environ.get("GROK2API_REG_LOCAL_CONCURRENCY", "3") or 3)),
     )
 except (TypeError, ValueError):
-    LOCAL_CAPTCHA_MAX_CONCURRENCY = 2
+    LOCAL_CAPTCHA_MAX_CONCURRENCY = 3
 
 # When captcha_provider=local, registration must wait for the inline Turnstile
 # Solver HTTP to answer before spawning workers. Prevents "already running but
@@ -91,9 +98,28 @@ _batches: dict[str, dict[str, Any]] = {}
 _lock = threading.RLock()
 # batch_id -> True while a local ThreadPool spawner is alive in THIS process.
 _active_batch_runners: dict[str, bool] = {}
-# Local captcha solver is process-local and can collapse under fan-out; serialize
-# the createTask/getTaskResult handshake across registration workers.
-_local_captcha_lock = threading.RLock()
+# Local captcha: limit concurrent solves to the Camoufox browser pool size.
+# RLock serialization used to force 1-at-a-time even with TURNSTILE_THREAD=4,
+# killing multi-thread throughput. Semaphore lets N browsers work in parallel.
+def _local_captcha_slots() -> int:
+    # Align with TURNSTILE_THREAD when set, else LOCAL_CAPTCHA_MAX_CONCURRENCY.
+    slots = LOCAL_CAPTCHA_MAX_CONCURRENCY
+    for env_name in ("TURNSTILE_THREAD", "GROK2API_TURNSTILE_THREAD"):
+        raw = (os.environ.get(env_name) or "").strip()
+        if not raw:
+            continue
+        try:
+            n = int(raw)
+            if n > 0:
+                slots = max(1, min(6, n, LOCAL_CAPTCHA_MAX_CONCURRENCY))
+                break
+        except (TypeError, ValueError):
+            pass
+    return max(1, min(6, int(slots)))
+
+
+_local_captcha_sem = threading.Semaphore(_local_captcha_slots())
+_local_captcha_slots_n = _local_captcha_slots()
 # Cross-batch in-flight registration jobs (3 open batches * 8 workers used to
 # stampede local Camoufox + xAI device-flow). Cap total concurrent registrations.
 try:
@@ -101,12 +127,17 @@ try:
         1,
         min(
             8,
-            int(os.environ.get("GROK2API_REG_GLOBAL_INFLIGHT", "3") or 3),
+            int(os.environ.get("GROK2API_REG_GLOBAL_INFLIGHT", "4") or 4),
         ),
     )
 except (TypeError, ValueError):
-    _GLOBAL_REG_INFLIGHT_MAX = 6
+    _GLOBAL_REG_INFLIGHT_MAX = 4
 _global_reg_inflight = threading.Semaphore(_GLOBAL_REG_INFLIGHT_MAX)
+# Throttle Redis mirror writes: progress still updates local RAM every step;
+# cross-worker / admin poll only needs ~100–200ms freshness.
+_REG_MIRROR_MIN_INTERVAL_SEC = float(os.environ.get("GROK2API_REG_MIRROR_MIN_SEC", "0.12") or 0.12)
+_REG_MIRROR_MIN_INTERVAL_SEC = max(0.04, min(1.0, _REG_MIRROR_MIN_INTERVAL_SEC))
+_reg_mirror_last: dict[str, float] = {}
 # Soft rate-limit signal: after device-flow / captcha storms, temporarily reduce
 # new job admission without killing already-running workers.
 _reg_soft_pause_until = 0.0
@@ -127,7 +158,7 @@ def _note_reg_pressure(reason: str = "", *, pause_sec: float | None = None) -> N
         sec = float(
             pause_sec
             if pause_sec is not None
-            else (os.environ.get("GROK2API_REG_SOFT_PAUSE_SEC", "8") or 8)
+            else (os.environ.get("GROK2API_REG_SOFT_PAUSE_SEC", "5") or 5)
         )
     except (TypeError, ValueError):
         sec = 8.0
@@ -177,7 +208,7 @@ def _release_reg_admission_once(flag: dict[str, bool]) -> None:
 REG_BATCH_RUNNER_LOCK_TTL = int(os.environ.get("GROK2API_REG_RUNNER_LOCK_TTL", "90") or 90)
 # How many jobs may be pre-created (mailbox + session) beyond the live concurrency
 # cap. Keep small so stop/cancel doesn't waste dozens of mailboxes.
-REG_PREFETCH_SLOTS = int(os.environ.get("GROK2API_REG_PREFETCH_SLOTS", "0") or 0)
+REG_PREFETCH_SLOTS = int(os.environ.get("GROK2API_REG_PREFETCH_SLOTS", "1") or 1)
 try:
     # Default 25s so dead runners / orphan mid-captcha sessions are healed faster
     # without thrashing healthy workers (was 45s → felt "stuck" for a minute+).
@@ -449,7 +480,7 @@ def _session_cancel_requested(sess: dict[str, Any] | None) -> bool:
     return _is_cancel_status(sess.get("status"))
 
 
-def _mirror_reg_sess(sid: str, sess: dict[str, Any] | None) -> None:
+def _mirror_reg_sess(sid: str, sess: dict[str, Any] | None, *, force: bool = False) -> None:
     if not _reg_redis() or not sid:
         return
     try:
@@ -457,25 +488,57 @@ def _mirror_reg_sess(sid: str, sess: dict[str, Any] | None) -> None:
 
         if sess is None:
             sessions_redis.reg_sess_delete(sid)
-        else:
-            # Always strip process-local fields before Redis write.
-            payload = {
-                k: v
-                for k, v in sess.items()
-                if isinstance(k, str) and not k.startswith("_") and not callable(v)
-            }
-            sessions_redis.reg_sess_put(sid, payload)
+            _reg_mirror_last.pop(f"s:{sid}", None)
+            return
+        # Throttle non-terminal mirrors — local RAM still updates every step for
+        # same-process batch GET; Redis only needs ~100ms freshness for multi-worker UI.
+        st = str(sess.get("status") or "").lower()
+        terminal = st in _TERMINAL_STATUSES or bool(sess.get("finished")) or force
+        if not terminal:
+            now = float(_now())
+            key = f"s:{sid}"
+            last = float(_reg_mirror_last.get(key) or 0.0)
+            if (now - last) < _REG_MIRROR_MIN_INTERVAL_SEC:
+                return
+            _reg_mirror_last[key] = now
+        # Always strip process-local fields before Redis write.
+        payload = {
+            k: v
+            for k, v in sess.items()
+            if isinstance(k, str) and not k.startswith("_") and not callable(v)
+        }
+        # Cap log payload in Redis — admin only needs recent steps.
+        lines = list(payload.get("log_lines") or [])
+        if len(lines) > 20:
+            payload["log_lines"] = lines[-20:]
+        if payload.get("log") and len(str(payload.get("log"))) > 900:
+            payload["log"] = str(payload.get("log"))[-900:]
+            payload["output_tail"] = payload["log"]
+        sessions_redis.reg_sess_put(sid, payload)
+        if terminal:
+            _reg_mirror_last.pop(f"s:{sid}", None)
     except Exception:
         pass
 
 
-def _mirror_reg_batch(batch_id: str, batch: dict[str, Any] | None) -> None:
+def _mirror_reg_batch(batch_id: str, batch: dict[str, Any] | None, *, force: bool = False) -> None:
     if not _reg_redis() or not batch_id or batch is None:
         return
     try:
         from grok2api.store import sessions_redis
 
+        st = str(batch.get("status") or batch.get("batch_status") or "").lower()
+        terminal = st in ("done", "partial", "error", "cancelled", "stopped", "failed") or force
+        if not terminal:
+            now = float(_now())
+            key = f"b:{batch_id}"
+            last = float(_reg_mirror_last.get(key) or 0.0)
+            if (now - last) < max(_REG_MIRROR_MIN_INTERVAL_SEC, 0.2):
+                return
+            _reg_mirror_last[key] = now
         sessions_redis.reg_batch_put(batch_id, batch)
+        if terminal:
+            _reg_mirror_last.pop(f"b:{batch_id}", None)
     except Exception:
         pass
 
@@ -516,8 +579,12 @@ def _record_register_task(
 
 
 
-def _append_session_log(sess: dict[str, Any], status: str, message: str, *, max_lines: int = 28) -> None:
-    """Append a timestamped progress line for real-time admin registration log UI."""
+def _append_session_log(sess: dict[str, Any], status: str, message: str, *, max_lines: int = 22) -> None:
+    """Append a timestamped progress line for real-time admin registration log UI.
+
+    Keep the ring buffer small: batch GET embeds many sessions; oversized log_lines
+    dominate payload size and inflate Redis + Go→browser latency.
+    """
     try:
         lines = list(sess.get("log_lines") or [])
     except Exception:
@@ -528,8 +595,8 @@ def _append_session_log(sess: dict[str, Any], status: str, message: str, *, max_
         ts = time.strftime("%H:%M:%S")
     st = str(status or "").strip() or "—"
     msg = str(message or "").strip().replace("\n", " ")
-    if len(msg) > 160:
-        msg = msg[:160] + "…"
+    if len(msg) > 140:
+        msg = msg[:140] + "…"
     line = f"[{ts}] {st}: {msg}" if msg else f"[{ts}] {st}"
     # Dedup consecutive identical status+message (ignore timestamp prefix).
     # Also throttle high-frequency captcha poll slices ("waiting poll slice 1.0/2.0s")
@@ -543,6 +610,7 @@ def _append_session_log(sess: dict[str, Any], status: str, message: str, *, max_
             "waiting poll slice" in msg.lower()
             or "still processing" in msg.lower()
             or "poll slice" in msg.lower()
+            or "heartbeat" in msg.lower()
         )
         if noisy and len(prev) > 10:
             prev_body = prev[10:]
@@ -553,6 +621,7 @@ def _append_session_log(sess: dict[str, Any], status: str, message: str, *, max_
                         "waiting poll slice" in prev_body.lower()
                         or "still processing" in prev_body.lower()
                         or "poll slice" in prev_body.lower()
+                        or "heartbeat" in prev_body.lower()
                     )
                 except Exception:
                     last_noisy = False
@@ -560,7 +629,7 @@ def _append_session_log(sess: dict[str, Any], status: str, message: str, *, max_
                     # Replace last noisy line so UI shows latest progress without growth.
                     lines[-1] = line
                     sess["log_lines"] = lines[-max_lines:]
-                    sess["log"] = "\n".join(lines[-16:])
+                    sess["log"] = "\n".join(lines[-12:])
                     sess["output_tail"] = sess["log"]
                     return
     lines.append(line)
@@ -568,7 +637,7 @@ def _append_session_log(sess: dict[str, Any], status: str, message: str, *, max_
         lines = lines[-max_lines:]
     sess["log_lines"] = lines
     # Compact tail for older UI paths that only read log / output_tail.
-    sess["log"] = "\n".join(lines[-16:])
+    sess["log"] = "\n".join(lines[-12:])
     sess["output_tail"] = sess["log"]
 
 
@@ -795,20 +864,21 @@ def _clean_old_sessions() -> None:
     """
     now = _now()
     try:
-        term_ttl = float(os.environ.get("GROK2API_REG_SESSION_TERM_TTL", "900") or 900)
+        # Terminal rows only need a short window for the admin final card / SSO export.
+        term_ttl = float(os.environ.get("GROK2API_REG_SESSION_TERM_TTL", "300") or 300)
     except (TypeError, ValueError):
-        term_ttl = 900.0
+        term_ttl = 300.0
     try:
-        live_ttl = float(os.environ.get("GROK2API_REG_SESSION_LIVE_TTL", "21600") or 21600)
+        live_ttl = float(os.environ.get("GROK2API_REG_SESSION_LIVE_TTL", "14400") or 14400)
     except (TypeError, ValueError):
-        live_ttl = 21600.0
+        live_ttl = 14400.0
     try:
-        max_keep = int(os.environ.get("GROK2API_REG_SESSION_MAX", "80") or 80)
+        max_keep = int(os.environ.get("GROK2API_REG_SESSION_MAX", "48") or 48)
     except (TypeError, ValueError):
-        max_keep = 80
-    max_keep = max(20, min(300, max_keep))
-    term_ttl = max(120.0, min(7200.0, term_ttl))
-    live_ttl = max(term_ttl, min(48 * 3600.0, live_ttl))
+        max_keep = 48
+    max_keep = max(16, min(200, max_keep))
+    term_ttl = max(60.0, min(3600.0, term_ttl))
+    live_ttl = max(term_ttl, min(24 * 3600.0, live_ttl))
 
     for sid in list(_sessions.keys()):
         sess = _sessions.get(sid) or {}
@@ -891,11 +961,20 @@ def _compact_session(sess: dict[str, Any]) -> dict[str, Any]:
     out.pop("auth_json", None)
     # Compact: keep only short tail for admin UI (bulk reg holds hundreds of sessions).
     lines = list(out.get("log_lines") or [])
-    if len(lines) > 16:
-        out["log_lines"] = lines[-16:]
-    if out.get("log") and len(str(out.get("log"))) > 800:
-        out["log"] = str(out.get("log"))[-800:]
+    if len(lines) > 14:
+        out["log_lines"] = lines[-14:]
+    if out.get("log") and len(str(out.get("log"))) > 600:
+        out["log"] = str(out.get("log"))[-600:]
         out["output_tail"] = out["log"]
+    # Drop heavy probe result blobs from list/batch embeds (keep summary counts).
+    probe = out.get("probe")
+    if isinstance(probe, dict) and isinstance(probe.get("results"), list) and len(probe["results"]) > 6:
+        out["probe"] = {
+            "ok": probe.get("ok"),
+            "fail": probe.get("fail"),
+            "count": probe.get("count") or len(probe.get("results") or []),
+            "results": list(probe.get("results") or [])[-6:],
+        }
     return out
 
 
@@ -1800,9 +1879,11 @@ def start_registration(
         )
     except (TypeError, ValueError):
         workers = DEFAULT_CONCURRENCY
+    requested_workers = workers
     workers = max(1, min(workers, MAX_CONCURRENCY, n))
     # Local Camoufox: never run more parallel registrations than local solver
-    # can safely host (each browser ≈ hundreds of MB).
+    # can safely host (each browser ≈ hundreds of MB). Cap comes from
+    # GROK2API_REG_LOCAL_CONCURRENCY (UI concurrency is honored up to this).
     if provider == "local":
         workers = max(1, min(workers, LOCAL_CAPTCHA_MAX_CONCURRENCY, n))
 
@@ -1811,6 +1892,8 @@ def start_registration(
     except (TypeError, ValueError):
         stagger = 400
     stagger = max(0, min(stagger, 10_000))
+    # Do not raise stagger here — batch runner / resume may apply MIN_STAGGER only
+    # when env is set. Admin form value must win by default.
 
     # Build proxy pool once; each job picks one URL (rotation / random / sticky).
     proxy_pool = _proxy_pool(
@@ -1875,7 +1958,12 @@ def start_registration(
         "stagger_ms": stagger,
         "session_ids": [],
         "adapter_build": ADAPTER_BUILD,
-        "message": f"batch started count={n} concurrency={workers}",
+        "message": (
+            f"batch started count={n} concurrency={workers}"
+            + (f" (requested={requested_workers})" if requested_workers != workers else "")
+            + (f" local_cap={LOCAL_CAPTCHA_MAX_CONCURRENCY}" if provider == "local" else "")
+            + f" max={MAX_CONCURRENCY} inflight_global={_GLOBAL_REG_INFLIGHT_MAX}"
+        ),
         "error": None,
         "finished": 0,
         "ok_count": 0,
@@ -2065,6 +2153,7 @@ def _spawn_batch_runner(
         _default_strat = "round_robin"
     proxy_strat = (proxy_strategy or _default_strat or "round_robin").strip().lower()
     proxy_snapshot = (proxy or "\n".join(proxy_pool) or "").strip()
+    requested_workers = int(concurrency or DEFAULT_CONCURRENCY)
     workers = max(1, min(int(concurrency or DEFAULT_CONCURRENCY), MAX_CONCURRENCY, remaining))
     # captcha_provider may be passed in kwargs path; prefer batch reg_config.
     try:
@@ -2081,6 +2170,13 @@ def _spawn_batch_runner(
     if prov == "local" or (not prov and str(os.environ.get("GROK2API_CAPTCHA_PROVIDER") or os.environ.get("CAPTCHA_PROVIDER") or "local").lower() == "local"):
         workers = max(1, min(workers, LOCAL_CAPTCHA_MAX_CONCURRENCY, remaining))
     stagger = max(0, min(int(stagger_ms or 400), 10_000))
+    # Honor batch stagger; optional env floor only when MIN_STAGGER>0.
+    try:
+        min_stagger = int(os.environ.get("GROK2API_REG_MIN_STAGGER_MS", "0") or 0)
+    except (TypeError, ValueError):
+        min_stagger = 0
+    if (prov == "local" or str(os.environ.get("GROK2API_CAPTCHA_PROVIDER") or "local").lower() == "local") and min_stagger > 0:
+        stagger = max(stagger, min_stagger)
 
     with _lock:
         b = _batches.get(bid) or dict(batch)
@@ -2114,6 +2210,7 @@ def _spawn_batch_runner(
         prior_fail = int(b.get("fail_count") or 0)
         b["message"] = (
             f"starting remaining={remaining} threads={workers}"
+            + (f" requested={requested_workers}" if requested_workers != workers else "")
             + (f" already_done={prior_finished}" if prior_finished else "")
             + (f" proxies={len(proxy_pool)}" if proxy_pool else "")
         )
@@ -2146,7 +2243,7 @@ def _spawn_batch_runner(
         prefetch = max(0, min(int(REG_PREFETCH_SLOTS), max(0, workers)))
         # Never queue more work than global admission + local captcha can take.
         # Prefetch used to create extra mailboxes/sessions that pile up in RAM.
-        max_inflight = max(1, min(workers + prefetch, _GLOBAL_REG_INFLIGHT_MAX, workers + 1))
+        max_inflight = max(1, min(workers + prefetch, _GLOBAL_REG_INFLIGHT_MAX, workers + max(1, prefetch)))
 
         def _batch_cancel_requested() -> bool:
             with _lock:
@@ -2703,7 +2800,15 @@ def _run_registration(
             except Exception:
                 pass
             _sessions[sid] = cur
-            _mirror_reg_sess(sid, cur)
+            # Force Redis write on terminal / cancel so multi-worker UI sees exit ASAP.
+            _mirror_reg_sess(
+                sid,
+                cur,
+                force=bool(
+                    str(status or "").lower() in _TERMINAL_STATUSES
+                    or str(status or "").lower() in ("stopping", "cancelled", "stopped")
+                ),
+            )
             # Single-session jobs: stream progress into task_logs (throttled).
             # Batch sessions are summarized on the batch row to avoid N*step spam.
             if not bid:
@@ -2917,22 +3022,22 @@ def _run_registration(
             if provider != "local":
                 return solver.solve_turnstile(**kwargs)
 
-            # Local path: do NOT block the whole worker silently under the lock.
-            # Bulk (>=600) jobs easily queue for minutes; reclaim previously
-            # killed those sessions after ~180s of no heartbeat.
+            # Local path: semaphore permits up to browser-pool size concurrent
+            # solves. Queue heartbeats keep registration sessions alive while
+            # waiting for a free Camoufox slot.
             wait_started = time.time()
             last_beat = 0.0
             while True:
                 _check_cancel()
-                acquired = _local_captcha_lock.acquire(timeout=5.0)
+                acquired = _local_captcha_sem.acquire(timeout=5.0)
                 if not acquired:
                     waited = time.time() - wait_started
-                    if waited - last_beat >= 15.0:
+                    if waited - last_beat >= 12.0:
                         last_beat = waited
                         update(
                             "solving_turnstile",
-                            f"queued for local Turnstile ({int(waited)}s) "
-                            f"[{ADAPTER_BUILD}]",
+                            f"queued for local Turnstile ({int(waited)}s, "
+                            f"slots={_local_captcha_slots_n}) [{ADAPTER_BUILD}]",
                         )
                     continue
                 try:
@@ -2966,11 +3071,12 @@ def _run_registration(
                                 "crashed",
                             )
                         ):
-                            _note_reg_pressure(f"local captcha: {e}")
+                            # Short pressure only — multi-thread already paces via slots.
+                            _note_reg_pressure(f"local captcha: {e}", pause_sec=4)
                         raise
                 finally:
                     try:
-                        _local_captcha_lock.release()
+                        _local_captcha_sem.release()
                     except Exception:
                         pass
 
@@ -3375,24 +3481,24 @@ def _run_registration(
                     1,
                     min(
                         8,
-                        int(os.environ.get("GROK2API_REG_SSO_LOGIN_ROUNDS", "4") or 4),
+                        int(os.environ.get("GROK2API_REG_SSO_LOGIN_ROUNDS", "5") or 5),
                     ),
                 )
             except (TypeError, ValueError):
-                sso_rounds = 4
+                sso_rounds = 5
             try:
                 sso_prop_sec = max(
                     0.5,
                     min(
                         20.0,
                         float(
-                            os.environ.get("GROK2API_REG_SSO_PROPAGATE_SEC", "3.5")
-                            or 3.5
+                            os.environ.get("GROK2API_REG_SSO_PROPAGATE_SEC", "2.5")
+                            or 2.5
                         ),
                     ),
                 )
             except (TypeError, ValueError):
-                sso_prop_sec = 3.5
+                sso_prop_sec = 2.5
 
             update(
                 "fetching_sso",
@@ -3424,8 +3530,10 @@ def _run_registration(
                             f"[grok-build-auth] sign-in turnstile round "
                             f"{round_i} failed: {ts_err}"
                         )
-                        # Reuse signup token only as last resort on first round.
-                        signin_turnstile = turnstile if round_i == 1 else None
+                        # Reuse signup token for first 2 rounds — still often
+                        # accepted by CreateSession and avoids a second captcha
+                        # under multi-thread pressure.
+                        signin_turnstile = turnstile if round_i <= 2 else None
                     if not signin_turnstile:
                         sso_attempts.append(f"round{round_i}:no_turnstile")
                         time.sleep(min(8.0, sso_prop_sec + round_i))
@@ -3458,7 +3566,8 @@ def _run_registration(
                     )
                     sso_attempts.append(f"round{round_i}:loop_err:{cs_loop_err}")
                 # Backoff so newly created accounts become visible / rate limits cool.
-                time.sleep(min(12.0, sso_prop_sec + round_i * 1.5))
+                # Multi-thread: keep waits shorter; still grow with round index.
+                time.sleep(min(8.0, sso_prop_sec + round_i * 1.0))
 
             # Final jar scrape in case a late set-cookie landed.
             if not sso:
@@ -3554,13 +3663,29 @@ def _run_registration(
         if sess.get("batch_id"):
             import_payload["registration_batch_id"] = sess.get("batch_id")
         if sso_cookie:
+            # Always write top-level + nested shapes so PG payload, has_sso filters,
+            # and admin "导出全部 SSO" see newly registered accounts without reconcile.
             import_payload["sso"] = sso_cookie
             import_payload["sso_cookie"] = sso_cookie
+            import_payload["sso_token"] = sso_cookie
+            sc = dict(session_cookies or {})
+            sc["sso"] = sso_cookie
+            sc["sso-rw"] = sso_cookie
+            import_payload["session_cookies"] = sc
+            # Also keep a cookie-header form for GetSSOValue regex paths.
+            import_payload.setdefault("cookie", f"sso={sso_cookie}")
         if reg_password:
             import_payload["password"] = reg_password
             import_payload["register_password"] = reg_password
         if sso_backup_path:
             import_payload["sso_backup_path"] = sso_backup_path
+        # Force-normalize durable SSO aliases before write (defensive).
+        try:
+            from grok2api.pool.accounts import merge_durable_account_fields as _mdf
+            merge_durable_account_fields = _mdf
+            merge_durable_account_fields(import_payload, None)
+        except Exception:
+            pass
         import_result = accounts.import_auth_payload(import_payload, merge=True)
         if not import_result.get("ok"):
             raise RuntimeError(
@@ -3599,15 +3724,22 @@ def _run_registration(
                     payload = hit[1] if isinstance(hit, tuple) and len(hit) == 2 else None
                     if not isinstance(payload, dict):
                         continue
-                    if _gsv(payload):
+                    # Require top-level sso string (not only nested) for export-all.
+                    top = str(payload.get("sso") or payload.get("sso_cookie") or "").strip()
+                    if top and _gsv(payload):
                         continue
                     print(
-                        f"[grok-build-auth] WARN: account {aid} imported without SSO "
+                        f"[grok-build-auth] WARN: account {aid} imported without top-level SSO "
                         f"in payload; rewriting sso field [{ADAPTER_BUILD}]"
                     )
                     fix = dict(payload)
                     fix["sso"] = sso_cookie
                     fix["sso_cookie"] = sso_cookie
+                    fix["sso_token"] = sso_cookie
+                    sc = dict(fix.get("session_cookies") or {}) if isinstance(fix.get("session_cookies"), dict) else {}
+                    sc["sso"] = sso_cookie
+                    sc["sso-rw"] = sso_cookie
+                    fix["session_cookies"] = sc
                     if reg_password:
                         fix.setdefault("password", reg_password)
                         fix.setdefault("register_password", reg_password)
@@ -3875,11 +4007,29 @@ def _run_registration(
                 client.close()
             except Exception:
                 pass
+        # Always drop process-local handles so mailbox / captcha clients do not
+        # pin sockets after cancel/error/import. Mirror once more so other workers
+        # see the stripped session promptly.
         with _lock:
             final_sess = dict(_sessions.get(sid) or sess or {})
             if sid in _sessions:
-                _sessions[sid].pop("_receiver", None)
-                _sessions[sid].pop("_client", None)
+                for k in ("_receiver", "_client", "_oauth_client"):
+                    obj = _sessions[sid].pop(k, None)
+                    if obj is None:
+                        continue
+                    for meth in ("close", "stop", "shutdown", "cancel"):
+                        fn = getattr(obj, meth, None)
+                        if callable(fn):
+                            try:
+                                fn()
+                            except Exception:
+                                pass
+                            break
+                try:
+                    _mirror_reg_sess(sid, _sessions[sid], force=True)
+                except Exception:
+                    pass
+                final_sess = dict(_sessions[sid])
         # Single sessions write their own terminal task log. Batch sessions are
         # summarized once by the batch finalizer (avoids N noise rows).
         if final_sess and not final_sess.get("batch_id"):
@@ -4232,17 +4382,22 @@ def resume_registration_batch(
     # safer concurrency so multiple auto-resumed batches don't thrash Camoufox.
     if provider == "local":
         try:
-            local_cap = int(os.environ.get("GROK2API_REG_LOCAL_CONCURRENCY", "3") or 3)
+            local_cap = int(
+                os.environ.get("GROK2API_REG_LOCAL_CONCURRENCY")
+                or LOCAL_CAPTCHA_MAX_CONCURRENCY
+                or 3
+            )
         except (TypeError, ValueError):
-            local_cap = 3
+            local_cap = LOCAL_CAPTCHA_MAX_CONCURRENCY
         workers = max(1, min(workers, max(1, local_cap)))
     stagger = int(cfg.get("stagger_ms") or batch.get("stagger_ms") or 400)
-    # Spread job starts a bit more under pressure.
+    # Optional floor for local captcha (env). Default 0 so admin "错峰 ms" is effective.
+    # Set GROK2API_REG_MIN_STAGGER_MS>0 only when you want a safety minimum under load.
     try:
-        min_stagger = int(os.environ.get("GROK2API_REG_MIN_STAGGER_MS", "600") or 600)
+        min_stagger = int(os.environ.get("GROK2API_REG_MIN_STAGGER_MS", "0") or 0)
     except (TypeError, ValueError):
-        min_stagger = 600
-    if provider == "local":
+        min_stagger = 0
+    if provider == "local" and min_stagger > 0:
         stagger = max(stagger, min_stagger)
     mail_provider, mail_key, mail_base, mail_dom = _resolve_mail_credentials(
         mail_provider=str(cfg.get("mail_provider") or "moemail"),
@@ -4570,8 +4725,26 @@ def stop_registration_session(session_id: str) -> dict[str, Any]:
         cur["status"] = "stopping"
         cur["message"] = "stop requested; waiting for worker to exit"
         cur["updated_at"] = _now()
+        # Best-effort immediate release of process-local handles so Camoufox /
+        # mailbox sockets do not linger until the worker next hits update().
+        for k in ("_receiver", "_client", "_oauth_client"):
+            obj = cur.pop(k, None)
+            if obj is None:
+                continue
+            for meth in ("close", "stop", "shutdown", "cancel"):
+                fn = getattr(obj, meth, None)
+                if callable(fn):
+                    try:
+                        fn()
+                    except Exception:
+                        pass
+                    break
+        try:
+            _append_session_log(cur, "stopping", "stop requested")
+        except Exception:
+            pass
         _sessions[sid] = cur
-        _mirror_reg_sess(sid, cur)
+        _mirror_reg_sess(sid, cur, force=True)
         out = _compact_session(cur)
     return {"ok": True, "id": sid, **out}
 
@@ -4956,7 +5129,10 @@ def get_registration_batch(batch_id: str) -> dict[str, Any] | None:
     stats = _batch_stats(sids, batch=b)
     # Keep response bounded for large batches. Prefer LIVE (non-terminal) sessions
     # so the admin log always shows in-flight progress, not only the newest finished ones.
-    MAX_BATCH_SESSIONS = 40
+    try:
+        MAX_BATCH_SESSIONS = max(8, min(32, int(os.environ.get("GROK2API_REG_BATCH_EMBED", "24") or 24)))
+    except (TypeError, ValueError):
+        MAX_BATCH_SESSIONS = 24
     loaded: list[dict[str, Any]] = []
     for s in sids:
         sess = _load_reg_sess(s)
