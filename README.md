@@ -1,4 +1,4 @@
-# grokcli-2api
+# grokcli-2api【注册拉闸】
 
 把 **Grok OIDC 登录态** 转成 **OpenAI / Anthropic 兼容 API**，并附带 Web 管理台：多 API Key、多账号轮询、设备码 / SSO / JSON 导入导出、协议注册。
 
