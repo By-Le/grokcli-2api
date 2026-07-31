@@ -112,7 +112,8 @@ func probeUpstreamStatus(ctx context.Context, options Options, force bool) map[s
 }
 
 func doUpstreamProbe(ctx context.Context, options Options) map[string]any {
-	base := strings.TrimRight(strings.TrimSpace(options.Config.UpstreamBase), "/")
+	origin := upstreamModelsURL(options)
+	base := strings.TrimSuffix(strings.TrimRight(strings.TrimSpace(origin), "/"), "/models")
 	now := time.Now()
 	out := map[string]any{
 		"ok":             false,
@@ -126,7 +127,6 @@ func doUpstreamProbe(ctx context.Context, options Options) map[string]any {
 		out["error"] = "upstream base not configured"
 		return out
 	}
-	origin := base + "/models"
 	out["origin"] = origin
 
 	// 1) TCP/TLS reachability (host:port from URL).
@@ -152,7 +152,15 @@ func doUpstreamProbe(ctx context.Context, options Options) map[string]any {
 	// 2) HTTP GET /models — with live account token when available.
 	viaEmail := ""
 	token := ""
-	if options.Store != nil {
+	if len(options.Candidates) > 0 {
+		for _, candidate := range options.Candidates {
+			if strings.TrimSpace(candidate.Token) != "" {
+				token = candidate.Token
+				viaEmail = candidate.ID
+				break
+			}
+		}
+	} else if options.Store != nil {
 		if auths, err := options.Store.ListAccountAuths(ctx, 5, true); err == nil && len(auths) > 0 {
 			// Prefer a non-empty token.
 			for _, a := range auths {

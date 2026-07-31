@@ -36,3 +36,24 @@ func TestResolveAliases(t *testing.T) {
 		}
 	}
 }
+
+func TestMiniMaxCatalogAndAliases(t *testing.T) {
+	catalog := NewCatalog(config.Config{MiniMaxAPIKey: "configured"}, nil)
+	items := catalog.PublicModels(t.Context())
+	if len(items) != 2 {
+		t.Fatalf("models=%#v", items)
+	}
+	if items[0]["id"] != "MiniMax-M3" || items[0]["owned_by"] != "MiniMax" || items[0]["context_window"] != 1_000_000 {
+		t.Fatalf("primary model=%#v", items[0])
+	}
+	modalities, _ := items[0]["input_modalities"].([]string)
+	if len(modalities) != 3 || modalities[1] != "image" || modalities[2] != "video" {
+		t.Fatalf("modalities=%#v", modalities)
+	}
+	if got := catalog.Resolve("minimax-latest"); got != "MiniMax-M3" {
+		t.Fatalf("latest alias=%q", got)
+	}
+	if got := catalog.Resolve("minimax-m2.7"); got != "MiniMax-M2.7" {
+		t.Fatalf("model alias=%q", got)
+	}
+}

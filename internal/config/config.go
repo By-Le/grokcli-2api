@@ -7,6 +7,8 @@ import (
 	"strconv"
 	"strings"
 	"time"
+
+	"github.com/hm2899/grokcli-2api/internal/upstream/minimax"
 )
 
 const (
@@ -29,6 +31,10 @@ type Config struct {
 	Port                            int
 	DefaultModel                    string
 	UpstreamBase                    string
+	MiniMaxAPIKey                   string
+	MiniMaxRegion                   string
+	MiniMaxOpenAIBaseURL            string
+	MiniMaxAnthropicBaseURL         string
 	RedisURL                        string
 	DatabaseURL                     string
 	RedisPrefix                     string
@@ -153,6 +159,22 @@ func Load() (Config, error) {
 	if err != nil {
 		return Config{}, err
 	}
+	miniMaxRegion, err := envEnum("MINIMAX_REGION", minimax.RegionGlobalEN, minimax.RegionGlobalEN, minimax.RegionCNZH)
+	if err != nil {
+		return Config{}, err
+	}
+	miniMaxEndpoints, ok := minimax.EndpointsForRegion(miniMaxRegion)
+	if !ok {
+		return Config{}, fmt.Errorf("MINIMAX_REGION is not supported")
+	}
+	miniMaxAPIKey := envString("MINIMAX_API_KEY", "")
+	configuredDefaultModel := envString("GROK2API_DEFAULT_MODEL", defaultModel)
+	if miniMaxAPIKey != "" {
+		configuredDefaultModel = minimax.ResolveModel(configuredDefaultModel, minimax.DefaultModel)
+		if !minimax.IsModel(configuredDefaultModel) {
+			configuredDefaultModel = minimax.DefaultModel
+		}
+	}
 
 	storeBackend, err := envEnum("GROK2API_STORE_BACKEND", "hybrid", "hybrid", "file")
 	if err != nil {
@@ -187,8 +209,12 @@ func Load() (Config, error) {
 	return Config{
 		Host:                            envString("GROK2API_HOST", defaultHost),
 		Port:                            port,
-		DefaultModel:                    envString("GROK2API_DEFAULT_MODEL", defaultModel),
+		DefaultModel:                    configuredDefaultModel,
 		UpstreamBase:                    strings.TrimRight(envString("GROK_CLI_CHAT_PROXY_BASE_URL", defaultUpstream), "/"),
+		MiniMaxAPIKey:                   miniMaxAPIKey,
+		MiniMaxRegion:                   miniMaxRegion,
+		MiniMaxOpenAIBaseURL:            strings.TrimRight(envString("MINIMAX_OPENAI_BASE_URL", miniMaxEndpoints.OpenAIBaseURL), "/"),
+		MiniMaxAnthropicBaseURL:         strings.TrimRight(envString("MINIMAX_ANTHROPIC_BASE_URL", miniMaxEndpoints.AnthropicBaseURL), "/"),
 		RedisURL:                        envAlias([]string{"GROK2API_REDIS_URL", "REDIS_URL"}, defaultRedisURL),
 		DatabaseURL:                     envAlias([]string{"GROK2API_DATABASE_URL", "DATABASE_URL"}, defaultDatabaseURL),
 		RedisPrefix:                     envString("GROK2API_REDIS_PREFIX", defaultRedisPrefix),
@@ -231,6 +257,10 @@ func Load() (Config, error) {
 
 func (c Config) Address() string {
 	return fmt.Sprintf("%s:%d", c.Host, c.Port)
+}
+
+func (c Config) MiniMaxEnabled() bool {
+	return strings.TrimSpace(c.MiniMaxAPIKey) != ""
 }
 
 func envString(name, fallback string) string {

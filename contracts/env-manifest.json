@@ -20,7 +20,40 @@
       "type": "string",
       "default": "grok-4.5",
       "scope": "startup_snapshot",
-      "future_scope": "runtime_setting"
+      "future_scope": "runtime_setting",
+      "go_behavior": "Defaults to MiniMax-M3 when MINIMAX_API_KEY is configured."
+    },
+    {
+      "name": "MINIMAX_API_KEY",
+      "type": "string",
+      "default": "",
+      "scope": "startup",
+      "sensitive": true,
+      "go_behavior": "Enables the MiniMax upstream adapter."
+    },
+    {
+      "name": "MINIMAX_REGION",
+      "type": "enum",
+      "values": [
+        "global_en",
+        "cn_zh"
+      ],
+      "default": "global_en",
+      "scope": "startup"
+    },
+    {
+      "name": "MINIMAX_OPENAI_BASE_URL",
+      "type": "url",
+      "default": "https://api.minimax.io/v1",
+      "scope": "startup",
+      "go_behavior": "Defaults to the OpenAI-compatible endpoint selected by MINIMAX_REGION."
+    },
+    {
+      "name": "MINIMAX_ANTHROPIC_BASE_URL",
+      "type": "url",
+      "default": "https://api.minimax.io/anthropic",
+      "scope": "startup",
+      "go_behavior": "Defaults to the Anthropic-compatible endpoint selected by MINIMAX_REGION."
     },
     {
       "name": "GROK_CLI_CHAT_PROXY_BASE_URL",

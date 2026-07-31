@@ -27,6 +27,11 @@ type Account struct {
 	Token string
 }
 
+type Opener interface {
+	Open(context.Context, Account, string, map[string]any) (*http.Response, error)
+	Headers(string, string, ...string) map[string]string
+}
+
 type Event struct {
 	Data []byte
 	Done bool
@@ -168,6 +173,10 @@ func (c *Client) Headers(token, model string, convID ...string) map[string]strin
 		out["x-grok-conv-id"] = id
 	}
 	return out
+}
+
+func (c *Client) ModelsURL() string {
+	return strings.TrimRight(strings.TrimSpace(c.BaseURL), "/") + "/models"
 }
 
 // extractConvID picks a stable session/cache key from the upstream body for

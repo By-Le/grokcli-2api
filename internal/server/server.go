@@ -64,9 +64,9 @@ type Options struct {
 	AdminSessions admin.SessionVerifier
 	PickObserver  proxy.PickObserver
 	AffinityStore proxy.AffinityStore
-	// Upstream is a shared Grok HTTP client (connection pool). Prefer this over
+	// Upstream is a shared HTTP client (connection pool). Prefer this over
 	// constructing a new client on every request.
-	Upstream    *grok.Client
+	Upstream    grok.Opener
 	Redis       *redis.Client
 	Leader      *redis.Leader
 	Maintainer  *maintainer.Service
@@ -1378,6 +1378,9 @@ func reportChatPool(r *http.Request, options Options, accountID string, ok bool,
 	if strings.TrimSpace(accountID) == "" {
 		return
 	}
+	if options.Config.MiniMaxEnabled() {
+		return
+	}
 	modelHint := ""
 	if len(requestedModel) > 0 {
 		modelHint = strings.TrimSpace(requestedModel[0])
@@ -1688,6 +1691,9 @@ func serveMessages(w http.ResponseWriter, r *http.Request, options Options) {
 	}
 	stream, _ := raw["stream"].(bool)
 	model := modelCatalog(options).Resolve(stringValue(raw["model"]))
+	if serveNativeMessages(w, r, options, apiKey, raw, model, stream) {
+		return
+	}
 	body, err := anthropic.BuildOpenAIChatBody(raw, model)
 	if err != nil {
 		writeAnthropicError(w, http.StatusBadRequest, err.Error(), "invalid_request_error")
@@ -6374,11 +6380,25 @@ func firstNonEmpty(values ...string) string {
 	return ""
 }
 
-func upstreamClient(options Options) *grok.Client {
+func upstreamClient(options Options) grok.Opener {
 	if options.Upstream != nil {
 		return options.Upstream
 	}
 	return &grok.Client{BaseURL: options.Config.UpstreamBase}
+}
+
+type upstreamModelsEndpoint interface {
+	ModelsURL() string
+}
+
+func upstreamModelsURL(options Options) string {
+	client := upstreamClient(options)
+	if endpoint, ok := client.(upstreamModelsEndpoint); ok {
+		if value := strings.TrimSpace(endpoint.ModelsURL()); value != "" {
+			return value
+		}
+	}
+	return strings.TrimRight(strings.TrimSpace(options.Config.UpstreamBase), "/") + "/models"
 }
 
 // resolvePickMode returns the configured account rotation mode for failover chains.
@@ -7711,50 +7731,65 @@ func serveAdminNormalizeAccounts(w http.ResponseWriter, r *http.Request, options
 	writeJSON(w, http.StatusOK, result)
 }
 
-// fetchUpstreamModels pulls /models from xAI using a live account token.
+// fetchUpstreamModels pulls /models using the configured upstream credentials.
 // Does NOT write the database — callers preview or save separately.
 func fetchUpstreamModels(ctx context.Context, options Options) (items []map[string]any, viaEmail string, origin string, err error) {
-	if options.Store == nil {
-		return nil, "", "", errors.New("store unavailable")
+	token := ""
+	if len(options.Candidates) > 0 {
+		for _, candidate := range options.Candidates {
+			if strings.TrimSpace(candidate.Token) != "" {
+				token = candidate.Token
+				viaEmail = candidate.ID
+				break
+			}
+		}
+	} else if options.Store != nil {
+		authList, listErr := options.Store.ListAccountAuths(ctx, 20, true)
+		if listErr != nil {
+			return nil, "", "", listErr
+		}
+		if len(authList) > 0 {
+			token = authList[0].Token
+			viaEmail = authList[0].Email
+		}
 	}
-	authList, err := options.Store.ListAccountAuths(ctx, 20, true)
-	if err != nil {
-		return nil, "", "", err
-	}
-	if len(authList) == 0 {
+	if strings.TrimSpace(token) == "" {
 		return nil, "", "", errors.New("no live account for models fetch")
 	}
-	a := authList[0]
-	origin = strings.TrimRight(options.Config.UpstreamBase, "/") + "/models"
+	origin = upstreamModelsURL(options)
 	client := &http.Client{Timeout: 30 * time.Second}
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, origin, nil)
 	if err != nil {
 		return nil, "", origin, err
 	}
 	gc := upstreamClient(options)
-	for k, v := range gc.Headers(a.Token, options.runtimeConfig().DefaultModel) {
+	for k, v := range gc.Headers(token, options.runtimeConfig().DefaultModel) {
 		req.Header.Set(k, v)
 	}
 	resp, err := client.Do(req)
 	if err != nil {
-		return nil, a.Email, origin, err
+		return nil, viaEmail, origin, err
 	}
 	defer resp.Body.Close()
 	body, _ := io.ReadAll(io.LimitReader(resp.Body, 4<<20))
 	if resp.StatusCode >= 400 {
-		return nil, a.Email, origin, fmt.Errorf("upstream %d: %s", resp.StatusCode, string(body)[:minInt(300, len(body))])
+		return nil, viaEmail, origin, fmt.Errorf("upstream %d: %s", resp.StatusCode, string(body)[:minInt(300, len(body))])
 	}
 	var payload any
 	if err := json.Unmarshal(body, &payload); err != nil {
-		return nil, a.Email, origin, fmt.Errorf("parse: %w", err)
+		return nil, viaEmail, origin, fmt.Errorf("parse: %w", err)
 	}
 	items = parseUpstreamModels(payload)
-	// Always keep local extras (coding/build/search aliases) even when upstream list is tiny.
-	items = ensureLocalModelExtras(items, options.runtimeConfig().DefaultModel)
-	if len(items) == 0 {
-		return nil, a.Email, origin, errors.New("no models in upstream response")
+	if options.Config.MiniMaxEnabled() {
+		items = modelCatalog(options).PublicModels(ctx)
+	} else {
+		// Always keep local extras (coding/build/search aliases) even when upstream list is tiny.
+		items = ensureLocalModelExtras(items, options.runtimeConfig().DefaultModel)
 	}
-	return items, a.Email, origin, nil
+	if len(items) == 0 {
+		return nil, viaEmail, origin, errors.New("no models in upstream response")
+	}
+	return items, viaEmail, origin, nil
 }
 
 // serveAdminModelsFetch: 仅从上游获取模型列表（预览，不写库）。

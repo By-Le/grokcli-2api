@@ -29,7 +29,7 @@ type Attempt struct {
 // and only before the caller commits model content or tool payload to the client.
 func OpenWithFailover(
 	ctx context.Context,
-	client *grok.Client,
+	client grok.Opener,
 	accounts []grok.Account,
 	model string,
 	body map[string]any,
