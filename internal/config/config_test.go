@@ -11,6 +11,10 @@ func TestLoadDefaults(t *testing.T) {
 		"GROK2API_PORT",
 		"GROK2API_DEFAULT_MODEL",
 		"GROK_CLI_CHAT_PROXY_BASE_URL",
+		"MINIMAX_API_KEY",
+		"MINIMAX_REGION",
+		"MINIMAX_OPENAI_BASE_URL",
+		"MINIMAX_ANTHROPIC_BASE_URL",
 		"GROK2API_REDIS_URL",
 		"REDIS_URL",
 		"GROK2API_DATABASE_URL",
@@ -49,6 +53,9 @@ func TestLoadDefaults(t *testing.T) {
 	}
 	if cfg.DefaultModel != "grok-4.5" {
 		t.Fatalf("unexpected model %q", cfg.DefaultModel)
+	}
+	if cfg.MiniMaxEnabled() {
+		t.Fatal("MiniMax must be disabled without an API key")
 	}
 	if cfg.SSEKeepalive != 4*time.Second {
 		t.Fatalf("unexpected keepalive %s", cfg.SSEKeepalive)
@@ -130,6 +137,32 @@ func TestLoadRejectsInvalidValues(t *testing.T) {
 	t.Setenv("GROK2API_PORT", "70000")
 	if _, err := Load(); err == nil {
 		t.Fatal("expected invalid port error")
+	}
+}
+
+func TestLoadMiniMaxRegionAndDefaults(t *testing.T) {
+	t.Setenv("MINIMAX_API_KEY", "configured")
+	t.Setenv("MINIMAX_REGION", "cn_zh")
+	t.Setenv("GROK2API_DEFAULT_MODEL", "")
+	t.Setenv("MINIMAX_OPENAI_BASE_URL", "")
+	t.Setenv("MINIMAX_ANTHROPIC_BASE_URL", "")
+
+	cfg, err := Load()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !cfg.MiniMaxEnabled() || cfg.DefaultModel != "MiniMax-M3" {
+		t.Fatalf("MiniMax configuration was not enabled: %#v", cfg)
+	}
+	if cfg.MiniMaxOpenAIBaseURL != "https://api.minimaxi.com/v1" || cfg.MiniMaxAnthropicBaseURL != "https://api.minimaxi.com/anthropic" {
+		t.Fatalf("regional endpoints=%q %q", cfg.MiniMaxOpenAIBaseURL, cfg.MiniMaxAnthropicBaseURL)
+	}
+}
+
+func TestLoadRejectsInvalidMiniMaxRegion(t *testing.T) {
+	t.Setenv("MINIMAX_REGION", "invalid")
+	if _, err := Load(); err == nil {
+		t.Fatal("expected invalid MiniMax region error")
 	}
 }
 

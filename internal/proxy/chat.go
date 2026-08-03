@@ -31,7 +31,7 @@ type AccountFailureReporter interface {
 
 type ChatService struct {
 	Catalog       *models.Catalog
-	Client        *grok.Client
+	Client        grok.Opener
 	Now           func() time.Time
 	PickObserver  PickObserver
 	AffinityStore AffinityStore
@@ -146,7 +146,7 @@ func (s *ChatService) CompleteWithResult(ctx context.Context, request ChatReques
 		return ChatResult{}, err
 	}
 	accounts := upstreamAccounts(chain)
-		body, prep := PrepareUpstreamBodyDetailed(request.Raw, request.UserAgent)
+	body, prep := PrepareUpstreamBodyDetailed(request.Raw, request.UserAgent)
 	ensureUpstreamCacheKey(body, request)
 	fingerprint := ChatFingerprint(request)
 	// Prefer account already boosted to chain[0] by prepareChain/ensureStickyCandidate.
@@ -249,7 +249,7 @@ func (s *ChatService) OpenStreamWithResult(ctx context.Context, request ChatRequ
 		return StreamOpen{}, err
 	}
 	accounts := upstreamAccounts(chain)
-		body, prep := PrepareUpstreamBodyDetailed(request.Raw, request.UserAgent)
+	body, prep := PrepareUpstreamBodyDetailed(request.Raw, request.UserAgent)
 	ensureUpstreamCacheKey(body, request)
 	fingerprint := ChatFingerprint(request)
 	// Prefer account already boosted to chain[0] by prepareChain/ensureStickyCandidate.
@@ -412,7 +412,7 @@ func (s *ChatService) OpenStreamWithResult(ctx context.Context, request ChatRequ
 func (s *ChatService) parallelFirstByteOpen(
 	ctx context.Context,
 	accounts []grok.Account,
-	client *grok.Client,
+	client grok.Opener,
 	model string,
 	body map[string]any,
 	chain []pool.Candidate,
@@ -607,7 +607,7 @@ func ForwardChatStreamWithStats(reader io.Reader, emit func(StreamFrame) error) 
 	return stats, err
 }
 
-func (s *ChatService) prepare(ctx context.Context, request ChatRequest, candidates []pool.Candidate, mode string) (string, pool.Candidate, *grok.Client, error) {
+func (s *ChatService) prepare(ctx context.Context, request ChatRequest, candidates []pool.Candidate, mode string) (string, pool.Candidate, grok.Opener, error) {
 	model := s.resolveModel(request)
 	now := time.Now()
 	if s.Now != nil {
@@ -639,7 +639,7 @@ func (s *ChatService) prepare(ctx context.Context, request ChatRequest, candidat
 // defaultFailoverChain matches Python MAX_FAILOVER_ATTEMPTS (short sticky-friendly chain).
 const defaultFailoverChain = 12
 
-func (s *ChatService) prepareChain(ctx context.Context, request ChatRequest, candidates []pool.Candidate, mode string) (string, []pool.Candidate, *grok.Client, error) {
+func (s *ChatService) prepareChain(ctx context.Context, request ChatRequest, candidates []pool.Candidate, mode string) (string, []pool.Candidate, grok.Opener, error) {
 	model := s.resolveModel(request)
 	now := time.Now()
 	if s.Now != nil {
@@ -1777,7 +1777,6 @@ func (s *ChatService) clearStickyPins(ctx context.Context, request ChatRequest) 
 	}
 }
 
-
 // shouldDropStickyPin reports whether a sticky-primary open failure is durable
 // enough to abandon the multi-turn pin. Transient network/timeouts keep the pin
 // so the next turn can retry the cache-warm account (avoids intermittent cache
@@ -1929,7 +1928,6 @@ func upstreamAccounts(chain []pool.Candidate) []grok.Account {
 	}
 	return accounts
 }
-
 
 // ensureUpstreamCacheKey guarantees body.prompt_cache_key survives Stabilize/Sanitize
 // so cli-chat-proxy /responses receives the same key that affinity used. Without this,

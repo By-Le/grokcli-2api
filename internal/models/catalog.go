@@ -8,6 +8,7 @@ import (
 
 	"github.com/hm2899/grokcli-2api/internal/config"
 	"github.com/hm2899/grokcli-2api/internal/store/postgres"
+	"github.com/hm2899/grokcli-2api/internal/upstream/minimax"
 )
 
 type Catalog struct {
@@ -24,6 +25,9 @@ func (c *Catalog) OpenAIList(ctx context.Context) map[string]any {
 }
 
 func (c *Catalog) PublicModels(ctx context.Context) []map[string]any {
+	if c != nil && c.cfg.MiniMaxEnabled() {
+		return minimax.CatalogEntries(time.Now().Unix())
+	}
 	if c != nil && c.store != nil {
 		rows, err := c.store.ListModels(ctx, false)
 		if err == nil && len(rows) > 0 {
@@ -47,6 +51,9 @@ func (c *Catalog) PublicModels(ctx context.Context) []map[string]any {
 
 func (c *Catalog) Resolve(model string) string {
 	m := strings.TrimSpace(model)
+	if c != nil && c.cfg.MiniMaxEnabled() {
+		return minimax.ResolveModel(m, c.defaultModel())
+	}
 	if m == "" {
 		return c.defaultModel()
 	}
@@ -64,6 +71,9 @@ func (c *Catalog) Resolve(model string) string {
 }
 
 func (c *Catalog) defaultModel() string {
+	if c != nil && c.cfg.MiniMaxEnabled() && strings.TrimSpace(c.cfg.DefaultModel) == "" {
+		return minimax.DefaultModel
+	}
 	if c == nil || strings.TrimSpace(c.cfg.DefaultModel) == "" {
 		return "grok-4.5"
 	}

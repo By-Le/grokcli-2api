@@ -17,6 +17,7 @@ import (
 	"github.com/hm2899/grokcli-2api/internal/maintainer"
 	"github.com/hm2899/grokcli-2api/internal/modelhealth"
 	"github.com/hm2899/grokcli-2api/internal/models"
+	"github.com/hm2899/grokcli-2api/internal/pool"
 	"github.com/hm2899/grokcli-2api/internal/protocol/historycompact"
 	"github.com/hm2899/grokcli-2api/internal/protocol/toolcall"
 	"github.com/hm2899/grokcli-2api/internal/quota"
@@ -25,6 +26,7 @@ import (
 	"github.com/hm2899/grokcli-2api/internal/store/postgres"
 	"github.com/hm2899/grokcli-2api/internal/store/redis"
 	"github.com/hm2899/grokcli-2api/internal/upstream/grok"
+	"github.com/hm2899/grokcli-2api/internal/upstream/minimax"
 	"github.com/hm2899/grokcli-2api/internal/upstream/oidc"
 )
 
@@ -79,7 +81,7 @@ func main() {
 		}
 	}
 
-	if store != nil {
+	if store != nil && !cfg.MiniMaxEnabled() {
 		oidcClient := &oidc.Client{}
 		maintSvc = maintainer.New(store, redisClient, oidcClient)
 		healthSvc = modelhealth.New(store, redisClient, cfg.UpstreamBase, []string{cfg.DefaultModel})
@@ -222,6 +224,24 @@ func main() {
 			slog.Warn("failed to load durable settings at boot", "error", err)
 		}
 	}
+	var upstreamHTTP grok.Opener = &grok.Client{BaseURL: cfg.UpstreamBase}
+	var candidates []pool.Candidate
+	var quotaSvc *quota.Service
+	if cfg.MiniMaxEnabled() {
+		upstreamHTTP = &minimax.Client{
+			OpenAIBaseURL:    cfg.MiniMaxOpenAIBaseURL,
+			AnthropicBaseURL: cfg.MiniMaxAnthropicBaseURL,
+		}
+		candidates = []pool.Candidate{{
+			ID:      "minimax",
+			Token:   cfg.MiniMaxAPIKey,
+			Enabled: true,
+			Weight:  1,
+		}}
+	} else {
+		quotaSvc = quota.New(store, cfg.UpstreamBase)
+	}
+
 	handler := server.NewMux(server.Options{
 		Ready:             readiness.Ready,
 		Reason:            readiness.Reason,
@@ -235,15 +255,16 @@ func main() {
 		APIKeys:           auth.NewAPIKeyVerifier(cfg, store),
 		Models:            models.NewCatalog(cfg, store),
 		Store:             store,
+		Candidates:        candidates,
 		AdminSessions:     adminSessions,
 		PickObserver:      redis.NewPickObserver(redisClient),
 		AffinityStore:     redis.NewChatAffinity(redisClient, 24*time.Hour),
-		Upstream:          &grok.Client{BaseURL: cfg.UpstreamBase},
+		Upstream:          upstreamHTTP,
 		Redis:             redisClient,
 		Leader:            leader,
 		Maintainer:        maintSvc,
 		ModelHealth:       healthSvc,
-		Quota:             quota.New(store, cfg.UpstreamBase),
+		Quota:             quotaSvc,
 		Config:            cfg,
 		RuntimeConfig:     &runtimeCfg,
 		RegistrationURL:   cfg.RegistrationServiceURL,
